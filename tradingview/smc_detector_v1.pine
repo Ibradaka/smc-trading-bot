@@ -162,7 +162,7 @@ f_direction(price_val, ema_val) =>
     price_val >= ema_val ? "bull" : "bear"
 
 // ============================================================
-// SECTION 3 — EMA 50 SUR LE HTF 4H
+// SECTION 3 — EMA 50 SUR LE HTF 4H + BIAIS DAILY
 // ============================================================
 // security() charge les données 4H même si le graphique est en 15M.
 // lookahead=barmerge.lookahead_off évite le look-ahead biais.
@@ -176,7 +176,27 @@ ema_50_4h = request.security(
 // EMA locale (même timeframe) — pour affichage de référence
 ema_50_local = ta.ema(close, 50)
 
-// Tracé conditionnel
+// --- Biais Daily ---
+// close_daily et ema_50_daily chargés depuis le timeframe journalier
+close_daily  = request.security(syminfo.tickerid, "D", close,          lookahead=barmerge.lookahead_off)
+ema_50_daily = request.security(syminfo.tickerid, "D", ta.ema(close, 50), lookahead=barmerge.lookahead_off)
+
+daily_bias_bull = close_daily > ema_50_daily  // biais haussier
+daily_bias_bear = close_daily < ema_50_daily  // biais baissier
+daily_bias_str  = daily_bias_bull ? "bull" : "bear"
+
+// Label biais daily — affiché en haut à gauche, mis à jour à chaque bougie
+if barstate.islast
+    label.new(
+         bar_index, ta.highest(high, 10),
+         text      = daily_bias_bull ? "BIAS D: BULL" : "BIAS D: BEAR",
+         style     = label.style_label_left,
+         color     = daily_bias_bull ? color.new(color.green, 10) : color.new(color.red, 10),
+         textcolor = color.white,
+         size      = size.normal
+     )
+
+// Tracé conditionnel EMA 4H
 plot(
      show_ema ? ema_50_4h : na,
      title    = "EMA 50 (4H)",
@@ -235,17 +255,19 @@ if show_swings and not na(raw_swing_low)
 
 sweep_buffer = f_pips_to_price(sweep_buffer_pips)
 
-// Condition SWEEP_HIGH
+// Condition SWEEP_HIGH — filtré : seulement si biais daily BEAR
 sweep_high_cond = not na(last_swing_high)
      and high > last_swing_high + sweep_buffer   // dépassement du swing
      and close < last_swing_high                  // clôture sous le swing (rejection)
      and close < open                             // bougie baissière (confirmation)
+     and daily_bias_bear                          // filtre biais daily
 
-// Condition SWEEP_LOW
+// Condition SWEEP_LOW — filtré : seulement si biais daily BULL
 sweep_low_cond = not na(last_swing_low)
      and low < last_swing_low - sweep_buffer      // dépassement du swing
      and close > last_swing_low                   // clôture au-dessus du swing (rejection)
      and close > open                             // bougie haussière (confirmation)
+     and daily_bias_bull                          // filtre biais daily
 
 // Calcul SL/TP pour sweeps
 // SL : au-delà du point extrême du sweep + buffer
@@ -311,15 +333,17 @@ plotshape(
 bos_ref_high = ta.highest(high, bos_lookback)[1]  // [1] = exclut la bougie actuelle
 bos_ref_low  = ta.lowest(low,  bos_lookback)[1]
 
-// BOS_BULL : clôture au-dessus du plus haut récent
+// BOS_BULL : clôture au-dessus du plus haut récent — filtré : seulement si biais daily BULL
 bos_bull_cond = close > bos_ref_high
      and close[1] <= bos_ref_high  // la bougie précédente était encore en dessous
      and not sweep_low_cond        // pas un double-comptage avec sweep
+     and daily_bias_bull           // filtre biais daily
 
-// BOS_BEAR : clôture en dessous du plus bas récent
+// BOS_BEAR : clôture en dessous du plus bas récent — filtré : seulement si biais daily BEAR
 bos_bear_cond = close < bos_ref_low
      and close[1] >= bos_ref_low   // la bougie précédente était encore au-dessus
      and not sweep_high_cond       // pas un double-comptage avec sweep
+     and daily_bias_bear           // filtre biais daily
 
 // SL/TP pour BOS
 // SL : sous/sur le niveau cassé + buffer
@@ -495,6 +519,7 @@ payload_sweep_high =
      '"sl_pips":'        + f_fmt(sweep_high_sl, 1)               + ','     +
      '"tp_pips":'        + f_fmt(sweep_high_tp, 1)               + ','     +
      '"ema_50_value":'   + f_fmt(ema_50_4h, 5)                   + ','     +
+     '"daily_bias":"'    + daily_bias_str                        + '",'    +
      '"session":"'       + f_session()                           + '"'     +
      '}'
 
@@ -512,6 +537,7 @@ payload_sweep_low =
      '"sl_pips":'        + f_fmt(sweep_low_sl, 1)                + ','     +
      '"tp_pips":'        + f_fmt(sweep_low_tp, 1)                + ','     +
      '"ema_50_value":'   + f_fmt(ema_50_4h, 5)                   + ','     +
+     '"daily_bias":"'    + daily_bias_str                        + '",'    +
      '"session":"'       + f_session()                           + '"'     +
      '}'
 
@@ -528,6 +554,7 @@ payload_bos_bull =
      '"sl_pips":'        + f_fmt(bos_bull_sl, 1)                 + ','     +
      '"tp_pips":'        + f_fmt(bos_bull_tp, 1)                 + ','     +
      '"ema_50_value":'   + f_fmt(ema_50_4h, 5)                   + ','     +
+     '"daily_bias":"'    + daily_bias_str                        + '",'    +
      '"session":"'       + f_session()                           + '"'     +
      '}'
 
@@ -544,6 +571,7 @@ payload_bos_bear =
      '"sl_pips":'        + f_fmt(bos_bear_sl, 1)                 + ','     +
      '"tp_pips":'        + f_fmt(bos_bear_tp, 1)                 + ','     +
      '"ema_50_value":'   + f_fmt(ema_50_4h, 5)                   + ','     +
+     '"daily_bias":"'    + daily_bias_str                        + '",'    +
      '"session":"'       + f_session()                           + '"'     +
      '}'
 
@@ -558,6 +586,7 @@ payload_session_open =
      '"direction":"'     + f_direction(close, ema_50_4h)         + '",'    +
      '"timestamp":"'     + f_timestamp()                         + '",'    +
      '"ema_50_value":'   + f_fmt(ema_50_4h, 5)                   + ','     +
+     '"daily_bias":"'    + daily_bias_str                        + '",'    +
      '"session":"'       + session_label                         + '"'     +
      '}'
 
@@ -580,6 +609,7 @@ payload_range_breakout =
      '"sl_pips":'        + f_fmt(range_bo_sl, 1)                 + ','     +
      '"tp_pips":'        + f_fmt(range_bo_tp, 1)                 + ','     +
      '"ema_50_value":'   + f_fmt(ema_50_4h, 5)                   + ','     +
+     '"daily_bias":"'    + daily_bias_str                        + '",'    +
      '"session":"'       + f_session()                           + '"'     +
      '}'
 
@@ -647,22 +677,22 @@ alertcondition(
 // [5] Message : coller le payload JSON correspondant ci-dessous
 //
 // ─── Message pour SWEEP_HIGH ───────────────────────────────
-// {"secret":"VOTRE_CLE_SECRETE","event_type":"SWEEP_HIGH","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bear","timestamp":"{{timenow}}","sweep_level":{{plot_0}},"sl_pips":20,"tp_pips":50,"ema_50_value":{{plot_1}},"session":"london"}
+// {"secret":"VOTRE_CLE_SECRETE","event_type":"SWEEP_HIGH","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bear","timestamp":"{{timenow}}","sweep_level":{{plot_0}},"sl_pips":20,"tp_pips":50,"ema_50_value":{{plot_1}},"daily_bias":"bear","session":"london"}
 //
 // ─── Message pour SWEEP_LOW ────────────────────────────────
-// {"secret":"VOTRE_CLE_SECRETE","event_type":"SWEEP_LOW","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bull","timestamp":"{{timenow}}","sweep_level":{{plot_0}},"sl_pips":20,"tp_pips":50,"ema_50_value":{{plot_1}},"session":"london"}
+// {"secret":"VOTRE_CLE_SECRETE","event_type":"SWEEP_LOW","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bull","timestamp":"{{timenow}}","sweep_level":{{plot_4}},"sl_pips":20,"tp_pips":50,"ema_50_value":{{plot_1}},"daily_bias":"bull","session":"london"}
 //
 // ─── Message pour BOS_BULL ─────────────────────────────────
-// {"secret":"VOTRE_CLE_SECRETE","event_type":"BOS_BULL","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bull","timestamp":"{{timenow}}","sl_pips":15,"tp_pips":40,"ema_50_value":{{plot_1}},"session":"london"}
+// {"secret":"VOTRE_CLE_SECRETE","event_type":"BOS_BULL","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bull","timestamp":"{{timenow}}","sl_pips":15,"tp_pips":40,"ema_50_value":{{plot_1}},"daily_bias":"bull","session":"london"}
 //
 // ─── Message pour BOS_BEAR ─────────────────────────────────
-// {"secret":"VOTRE_CLE_SECRETE","event_type":"BOS_BEAR","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bear","timestamp":"{{timenow}}","sl_pips":15,"tp_pips":40,"ema_50_value":{{plot_1}},"session":"london"}
+// {"secret":"VOTRE_CLE_SECRETE","event_type":"BOS_BEAR","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bear","timestamp":"{{timenow}}","sl_pips":15,"tp_pips":40,"ema_50_value":{{plot_1}},"daily_bias":"bear","session":"london"}
 //
 // ─── Message pour SESSION_OPEN ─────────────────────────────
-// {"secret":"VOTRE_CLE_SECRETE","event_type":"SESSION_OPEN","symbol":"EURUSD","timeframe":"4H","price":{{close}},"direction":"bull","timestamp":"{{timenow}}","ema_50_value":{{plot_1}},"session":"london"}
+// {"secret":"VOTRE_CLE_SECRETE","event_type":"SESSION_OPEN","symbol":"EURUSD","timeframe":"4H","price":{{close}},"direction":"bull","timestamp":"{{timenow}}","ema_50_value":{{plot_1}},"daily_bias":"bull","session":"london"}
 //
 // ─── Message pour RANGE_BREAKOUT ───────────────────────────
-// {"secret":"VOTRE_CLE_SECRETE","event_type":"RANGE_BREAKOUT","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bull","timestamp":"{{timenow}}","range_high":{{plot_2}},"range_low":{{plot_3}},"sl_pips":25,"tp_pips":60,"ema_50_value":{{plot_1}},"session":"london"}
+// {"secret":"VOTRE_CLE_SECRETE","event_type":"RANGE_BREAKOUT","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bull","timestamp":"{{timenow}}","range_high":{{plot_2}},"range_low":{{plot_3}},"sl_pips":25,"tp_pips":60,"ema_50_value":{{plot_1}},"daily_bias":"bull","session":"london"}
 //
 // NOTE sur {{timenow}} : TradingView envoie un timestamp Unix en ms.
 //   Le bot Python le convertit automatiquement en ISO 8601 UTC.
@@ -692,3 +722,6 @@ plot(range_low, title="[export] Range Low", display=display.none)
 
 // plot_4 : dernier swing low (sweep_level pour SWEEP_LOW)
 plot(last_swing_low, title="[export] Last Swing Low", display=display.none)
+
+// plot_5 : daily bias numérique (1 = bull, 0 = bear) — pour debug/template
+plot(daily_bias_bull ? 1 : 0, title="[export] Daily Bias (1=bull 0=bear)", display=display.none)
