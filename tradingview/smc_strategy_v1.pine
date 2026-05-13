@@ -1,0 +1,402 @@
+// ============================================================
+// SMC Strategy v1 — Smart Money Concepts Backtester
+// Projet   : SMC Trading Bot
+// Pipeline : Strategy Tester TradingView uniquement
+// Version  : 1.0.0
+// ============================================================
+//
+// RÔLE : Version strategy() du SMC Detector v1 pour backtesting.
+//        Reproduit fidèlement les mêmes filtres que le bot Python :
+//        - Session London / NY
+//        - EMA 50 4H
+//        - Daily Bias
+//        - Toutes les structures SMC
+//
+// UTILISATION :
+//   1. Coller dans Pine Editor TradingView
+//   2. Appliquer sur EURUSD 15M
+//   3. Onglet "Strategy Tester" en bas → résultats automatiques
+//
+// ============================================================
+
+//@version=6
+strategy(
+     title                = "SMC Strategy v1",
+     shorttitle           = "SMC-S v1",
+     overlay              = true,
+     initial_capital      = 3000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 0.02,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.007,
+     slippage             = 2,
+     process_orders_on_close = true,
+     max_bars_back        = 500,
+     pyramiding           = 0
+ )
+
+// ============================================================
+// SECTION 1 — PARAMÈTRES CONFIGURABLES
+// ============================================================
+
+var string GRP_RISK    = "Gestion du risque"
+var string GRP_SWING   = "Détection Swing / Sweep"
+var string GRP_BOS     = "Break of Structure"
+var string GRP_RANGE   = "Range Breakout"
+var string GRP_DISPLAY = "Affichage"
+
+// Risque
+sl_pips = input.float(
+     15.0, title="SL (pips)",
+     minval=5.0, maxval=100.0, step=1.0, group=GRP_RISK,
+     tooltip="Stop Loss en pips depuis le prix d'entrée")
+
+tp_pips = input.float(
+     35.0, title="TP (pips)",
+     minval=10.0, maxval=300.0, step=5.0, group=GRP_RISK,
+     tooltip="Take Profit en pips — RR = TP/SL")
+
+// Swing & Sweep
+swing_lookback = input.int(
+     10, title="Lookback pivot (bougies)",
+     minval=3, maxval=50, group=GRP_SWING)
+
+sweep_buffer_pips = input.float(
+     2.0, title="Buffer sweep (pips)",
+     minval=0.5, maxval=10.0, step=0.5, group=GRP_SWING)
+
+// BOS
+bos_lookback = input.int(
+     20, title="Lookback BOS (bougies)",
+     minval=5, maxval=100, group=GRP_BOS)
+
+// Range
+range_bars = input.int(
+     15, title="Durée range minimum (bougies)",
+     minval=8, maxval=50, group=GRP_RANGE)
+
+range_min_pips = input.float(
+     20.0, title="Amplitude range minimum (pips)",
+     minval=10.0, maxval=100.0, step=5.0, group=GRP_RANGE)
+
+range_atr_ratio = input.float(
+     0.4, title="Ratio ATR consolidation",
+     minval=0.1, maxval=0.8, step=0.05, group=GRP_RANGE)
+
+// Affichage
+show_swings    = input.bool(true,  title="Afficher niveaux swing",  group=GRP_DISPLAY)
+show_ema       = input.bool(true,  title="Afficher EMA 50 (4H)",    group=GRP_DISPLAY)
+show_bos_lines = input.bool(true,  title="Afficher lignes BOS",     group=GRP_DISPLAY)
+show_range_box = input.bool(true,  title="Afficher boîte range",    group=GRP_DISPLAY)
+show_labels    = input.bool(true,  title="Afficher labels signaux", group=GRP_DISPLAY)
+show_table     = input.bool(true,  title="Afficher tableau recap",  group=GRP_DISPLAY)
+
+// ============================================================
+// SECTION 2 — CONSTANTES ET UTILITAIRES
+// ============================================================
+
+PIP = syminfo.mintick * 10
+
+f_pips_to_price(pips) =>
+    pips * PIP
+
+f_price_to_pips(price_diff) =>
+    math.round(math.abs(price_diff) / PIP, 1)
+
+// Filtre session : London 08:00-11:00 UTC / NY 14:30-17:00 UTC
+f_in_session() =>
+    h = hour(time, "UTC")
+    m = minute(time, "UTC")
+    total_minutes = h * 60 + m
+    london = total_minutes >= 8 * 60        and total_minutes < 11 * 60
+    ny     = total_minutes >= 14 * 60 + 30  and total_minutes < 17 * 60
+    london or ny
+
+// ============================================================
+// SECTION 3 — EMA 50 4H + BIAIS DAILY
+// ============================================================
+
+ema_50_4h = request.security(
+     syminfo.tickerid, "240",
+     ta.ema(close, 50),
+     lookahead=barmerge.lookahead_off
+ )
+
+close_daily  = request.security(syminfo.tickerid, "D", close,             lookahead=barmerge.lookahead_off)
+ema_50_daily = request.security(syminfo.tickerid, "D", ta.ema(close, 50), lookahead=barmerge.lookahead_off)
+
+daily_bias_bull = close_daily > ema_50_daily
+daily_bias_bear = close_daily < ema_50_daily
+
+// Tracé EMA 4H
+plot(
+     show_ema ? ema_50_4h : na,
+     title     = "EMA 50 (4H)",
+     color     = color.new(color.orange, 0),
+     linewidth  = 2
+ )
+
+// Label biais daily
+if barstate.islast
+    label.new(
+         bar_index, ta.highest(high, 10),
+         text      = daily_bias_bull ? "BIAS D: BULL" : "BIAS D: BEAR",
+         style     = label.style_label_left,
+         color     = daily_bias_bull ? color.new(color.green, 10) : color.new(color.red, 10),
+         textcolor = color.white,
+         size      = size.normal
+     )
+
+// ============================================================
+// SECTION 4 — SWING HIGHS / LOWS
+// ============================================================
+
+raw_swing_high = ta.pivothigh(high, swing_lookback, swing_lookback)
+raw_swing_low  = ta.pivotlow(low,   swing_lookback, swing_lookback)
+
+var float last_swing_high = na
+var float last_swing_low  = na
+
+if not na(raw_swing_high)
+    last_swing_high := raw_swing_high
+
+if not na(raw_swing_low)
+    last_swing_low := raw_swing_low
+
+if show_swings and not na(raw_swing_high)
+    line.new(
+         bar_index - swing_lookback, raw_swing_high,
+         bar_index, raw_swing_high,
+         color=color.new(color.red, 50), style=line.style_dotted, width=1
+     )
+
+if show_swings and not na(raw_swing_low)
+    line.new(
+         bar_index - swing_lookback, raw_swing_low,
+         bar_index, raw_swing_low,
+         color=color.new(color.green, 50), style=line.style_dotted, width=1
+     )
+
+// ============================================================
+// SECTION 5 — SWEEP HIGH / SWEEP LOW
+// ============================================================
+
+sweep_buffer = f_pips_to_price(sweep_buffer_pips)
+
+sweep_high_cond = not na(last_swing_high)
+     and high  > last_swing_high + sweep_buffer
+     and close < last_swing_high
+     and close < open
+     and daily_bias_bear
+
+sweep_low_cond = not na(last_swing_low)
+     and low   < last_swing_low - sweep_buffer
+     and close > last_swing_low
+     and close > open
+     and daily_bias_bull
+
+if sweep_high_cond and show_labels
+    label.new(bar_index, high,
+         text="SWEEP H", style=label.style_label_down,
+         color=color.new(color.red, 10), textcolor=color.white, size=size.small)
+
+if sweep_low_cond and show_labels
+    label.new(bar_index, low,
+         text="SWEEP L", style=label.style_label_up,
+         color=color.new(color.green, 10), textcolor=color.white, size=size.small)
+
+plotshape(sweep_high_cond, title="Sweep High",
+     style=shape.triangledown, location=location.abovebar,
+     color=color.red, size=size.normal)
+
+plotshape(sweep_low_cond, title="Sweep Low",
+     style=shape.triangleup, location=location.belowbar,
+     color=color.green, size=size.normal)
+
+// ============================================================
+// SECTION 6 — BREAK OF STRUCTURE (BOS)
+// ============================================================
+
+bos_ref_high = ta.highest(high, bos_lookback)[1]
+bos_ref_low  = ta.lowest(low,  bos_lookback)[1]
+
+bos_bull_cond = close > bos_ref_high
+     and close[1] <= bos_ref_high
+     and not sweep_low_cond
+     and daily_bias_bull
+
+bos_bear_cond = close < bos_ref_low
+     and close[1] >= bos_ref_low
+     and not sweep_high_cond
+     and daily_bias_bear
+
+if bos_bull_cond and show_bos_lines
+    line.new(bar_index - 1, bos_ref_high, bar_index, bos_ref_high,
+         color=color.new(color.blue, 20), style=line.style_dashed, width=2)
+    if show_labels
+        label.new(bar_index, low, text="BOS +",
+             style=label.style_label_up,
+             color=color.new(color.blue, 10), textcolor=color.white, size=size.small)
+
+if bos_bear_cond and show_bos_lines
+    line.new(bar_index - 1, bos_ref_low, bar_index, bos_ref_low,
+         color=color.new(color.purple, 20), style=line.style_dashed, width=2)
+    if show_labels
+        label.new(bar_index, high, text="BOS -",
+             style=label.style_label_down,
+             color=color.new(color.purple, 10), textcolor=color.white, size=size.small)
+
+plotshape(bos_bull_cond, title="BOS Bull",
+     style=shape.labelup, location=location.belowbar,
+     color=color.blue, size=size.small)
+
+plotshape(bos_bear_cond, title="BOS Bear",
+     style=shape.labeldown, location=location.abovebar,
+     color=color.purple, size=size.small)
+
+// ============================================================
+// SECTION 7 — RANGE BREAKOUT
+// ============================================================
+
+atr_14          = ta.atr(14)
+range_high      = ta.highest(high, range_bars)
+range_low       = ta.lowest(low,  range_bars)
+range_size      = range_high - range_low
+range_size_pips = f_price_to_pips(range_size)
+
+is_consolidating = range_size <= atr_14 * range_atr_ratio * range_bars
+     and range_size_pips >= range_min_pips
+
+range_bull_cond = is_consolidating[1]
+     and close > range_high[1]
+     and close[1] <= range_high[1]
+
+range_bear_cond = is_consolidating[1]
+     and close < range_low[1]
+     and close[1] >= range_low[1]
+
+var box range_box = na
+if is_consolidating and not is_consolidating[1] and show_range_box
+    range_box := box.new(
+         bar_index - range_bars, range_high,
+         bar_index,              range_low,
+         border_color=color.new(color.yellow, 40),
+         bgcolor=color.new(color.yellow, 85),
+         border_width=1, border_style=line.style_dashed)
+
+if (range_bull_cond or range_bear_cond) and show_labels
+    label.new(bar_index, range_bull_cond ? low : high,
+         text  = "RANGE BO " + (range_bull_cond ? "+" : "-"),
+         style = range_bull_cond ? label.style_label_up : label.style_label_down,
+         color = color.new(color.yellow, 10), textcolor=color.black, size=size.small)
+
+plotshape(range_bull_cond, title="Range BO Bull",
+     style=shape.diamond, location=location.belowbar,
+     color=color.yellow, size=size.normal)
+
+plotshape(range_bear_cond, title="Range BO Bear",
+     style=shape.diamond, location=location.abovebar,
+     color=color.yellow, size=size.normal)
+
+// ============================================================
+// SECTION 8 — SIGNAUX D'ENTRÉE AGRÉGÉS
+// ============================================================
+
+in_session = f_in_session()
+
+// Long : SWEEP_LOW + BOS_BULL + RANGE_BREAKOUT ▲
+// Filtre EMA 4H : prix au-dessus de l'EMA pour les longs
+long_signal  = (sweep_low_cond or bos_bull_cond or range_bull_cond)
+     and in_session
+     and close > ema_50_4h
+     and daily_bias_bull
+
+// Short : SWEEP_HIGH + BOS_BEAR + RANGE_BREAKOUT ▼
+// Filtre EMA 4H : prix en-dessous de l'EMA pour les shorts
+short_signal = (sweep_high_cond or bos_bear_cond or range_bear_cond)
+     and in_session
+     and close < ema_50_4h
+     and daily_bias_bear
+
+// ============================================================
+// SECTION 9 — ENTRÉES / SORTIES STRATEGY
+// ============================================================
+
+sl_price_long  = close - f_pips_to_price(sl_pips)
+tp_price_long  = close + f_pips_to_price(tp_pips)
+
+sl_price_short = close + f_pips_to_price(sl_pips)
+tp_price_short = close - f_pips_to_price(tp_pips)
+
+if long_signal and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long TP/SL", from_entry="Long",
+         stop=sl_price_long, limit=tp_price_long)
+
+if short_signal and strategy.position_size == 0
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short TP/SL", from_entry="Short",
+         stop=sl_price_short, limit=tp_price_short)
+
+// ============================================================
+// SECTION 10 — TABLEAU RÉCAPITULATIF
+// ============================================================
+
+var table stats_table = table.new(
+     position.top_right, 2, 6,
+     bgcolor      = color.new(color.black, 20),
+     border_width = 1,
+     border_color = color.new(color.gray, 50)
+ )
+
+if barstate.islast and show_table
+    total_trades  = strategy.closedtrades
+    winning       = strategy.wintrades
+    losing        = strategy.losstrades
+    winrate       = total_trades > 0 ? math.round(winning / total_trades * 100, 1) : 0.0
+    gross_profit  = strategy.grossprofit
+    gross_loss    = math.abs(strategy.grossloss)
+    profit_factor = gross_loss > 0 ? math.round(gross_profit / gross_loss, 2) : 0.0
+    net_pnl       = strategy.netprofit
+    rr            = math.round(tp_pips / sl_pips, 2)
+
+    // En-tête
+    table.cell(stats_table, 0, 0, "SMC Strategy v1",
+         text_color=color.white, text_halign=text.align_left,
+         bgcolor=color.new(color.blue, 30), text_size=size.small)
+    table.cell(stats_table, 1, 0, "Résultats",
+         text_color=color.white, text_halign=text.align_right,
+         bgcolor=color.new(color.blue, 30), text_size=size.small)
+
+    // Trades
+    table.cell(stats_table, 0, 1, "Trades fermés",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 1, str.tostring(total_trades),
+         text_color=color.white, text_halign=text.align_right, text_size=size.small)
+
+    // Winrate
+    table.cell(stats_table, 0, 2, "Winrate",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 2, str.tostring(winrate) + " %",
+         text_color=winrate >= 50 ? color.green : color.red,
+         text_halign=text.align_right, text_size=size.small)
+
+    // RR
+    table.cell(stats_table, 0, 3, "RR (TP/SL)",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 3, str.tostring(rr) + ":1",
+         text_color=color.white, text_halign=text.align_right, text_size=size.small)
+
+    // Profit Factor
+    table.cell(stats_table, 0, 4, "Profit Factor",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 4, str.tostring(profit_factor),
+         text_color=profit_factor >= 1.5 ? color.green : profit_factor >= 1.0 ? color.yellow : color.red,
+         text_halign=text.align_right, text_size=size.small)
+
+    // Net PnL
+    table.cell(stats_table, 0, 5, "Net PnL",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 5, str.tostring(math.round(net_pnl, 2)) + " $",
+         text_color=net_pnl >= 0 ? color.green : color.red,
+         text_halign=text.align_right, text_size=size.small)
