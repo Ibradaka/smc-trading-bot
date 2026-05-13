@@ -36,7 +36,7 @@
 //
 // ============================================================
 
-//@version=5
+//@version=6
 indicator(
      title     = "SMC Detector v1",
      shorttitle= "SMC-D v1",
@@ -439,10 +439,19 @@ if (range_bull_cond or range_bear_cond) and show_labels
      )
 
 plotshape(
-     range_bull_cond or range_bear_cond,
-     title    = "Range Breakout signal",
+     range_bull_cond,
+     title    = "Range Breakout Bull signal",
      style    = shape.diamond,
-     location = range_bull_cond ? location.belowbar : location.abovebar,
+     location = location.belowbar,
+     color    = color.yellow,
+     size     = size.normal
+ )
+
+plotshape(
+     range_bear_cond,
+     title    = "Range Breakout Bear signal",
+     style    = shape.diamond,
+     location = location.abovebar,
      color    = color.yellow,
      size     = size.normal
  )
