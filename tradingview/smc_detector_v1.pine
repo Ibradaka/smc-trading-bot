@@ -1,0 +1,685 @@
+// ============================================================
+// SMC Detector v1 — Smart Money Concepts Signal Emitter
+// Projet   : SMC Trading Bot
+// Pipeline : TradingView → Webhook → FastAPI → PineConnector → MT5 → AXI
+// Version  : 1.0.0
+// Auteur   : À remplir
+// ============================================================
+//
+// RÔLE : Ce script est uniquement un capteur de structures.
+//        Il ne prend AUCUNE décision de trading.
+//        Chaque signal est envoyé brut au bot Python qui filtre et décide.
+//
+// UTILISATION :
+//   1. Coller ce script dans TradingView (Pine Editor)
+//   2. Appliquer sur graphique EURUSD 15M
+//   3. Créer une alerte sur chaque condition (voir §ALERTES en bas)
+//   4. URL webhook : https://{VPS_HOST}:8000/webhook
+//   5. Remplacer VOTRE_CLE_SECRETE par la valeur de WEBHOOK_SECRET_KEY
+//
+// ÉVÉNEMENTS ÉMIS :
+//   - SWEEP_HIGH    : balayage de liquidité haussière → signal bear
+//   - SWEEP_LOW     : balayage de liquidité baissière → signal bull
+//   - BOS_BULL      : break of structure haussier
+//   - BOS_BEAR      : break of structure baissier
+//   - SESSION_OPEN  : ouverture London ou NY (gestion interne bot)
+//   - RANGE_BREAKOUT: cassure de zone de consolidation
+//
+// TIMEFRAMES :
+//   - Graphique principal : 15M (MTF — détection structures)
+//   - Contexte chargé     : 4H  (HTF — EMA 50, biais directionnel)
+//
+// IMPORTANT — HEADERS HTTP :
+//   TradingView ne supporte pas les headers custom dans les webhooks.
+//   La clé secrète est donc incluse dans le payload JSON (champ "secret").
+//   Le bot Python valide ce champ en premier avant tout traitement.
+//
+// ============================================================
+
+//@version=5
+indicator(
+     title     = "SMC Detector v1",
+     shorttitle= "SMC-D v1",
+     overlay   = true,
+     max_lines_count  = 100,
+     max_labels_count = 100,
+     max_boxes_count  = 50
+ )
+
+// ============================================================
+// SECTION 1 — PARAMÈTRES CONFIGURABLES
+// ============================================================
+
+// --- Groupes d'inputs pour l'interface TradingView ---
+var string GRP_SWING    = "Détection Swing / Sweep"
+var string GRP_BOS      = "Break of Structure"
+var string GRP_RANGE    = "Range Breakout"
+var string GRP_RISK     = "SL / TP par défaut (pips)"
+var string GRP_DISPLAY  = "Affichage"
+var string GRP_WEBHOOK  = "Webhook"
+
+// Swing & Sweep
+swing_lookback = input.int(
+     10, title="Lookback pivot (bougies)",
+     minval=3, maxval=50, group=GRP_SWING,
+     tooltip="Nombre de bougies de chaque côté pour valider un swing high/low")
+
+sweep_buffer_pips = input.float(
+     2.0, title="Buffer sweep (pips)",
+     minval=0.5, maxval=10.0, step=0.5, group=GRP_SWING,
+     tooltip="Tolérance en pips au-delà du swing pour valider le dépassement")
+
+// BOS
+bos_lookback = input.int(
+     20, title="Lookback BOS (bougies)",
+     minval=5, maxval=100, group=GRP_BOS,
+     tooltip="Fenêtre de recherche du swing high/low de référence pour le BOS")
+
+// Range
+range_bars = input.int(
+     15, title="Durée range minimum (bougies)",
+     minval=8, maxval=50, group=GRP_RANGE,
+     tooltip="Nombre de bougies consécutives en consolidation pour valider un range")
+
+range_min_pips = input.float(
+     20.0, title="Amplitude range minimum (pips)",
+     minval=10.0, maxval=100.0, step=5.0, group=GRP_RANGE,
+     tooltip="Amplitude minimale du range en pips (filtre anti-micro-range)")
+
+range_atr_ratio = input.float(
+     0.4, title="Ratio ATR consolidation",
+     minval=0.1, maxval=0.8, step=0.05, group=GRP_RANGE,
+     tooltip="Range valide si volatilité < ratio × ATR(14)")
+
+// SL / TP par défaut
+default_sl_pips = input.float(
+     20.0, title="SL par défaut (pips)",
+     minval=5.0, maxval=100.0, step=1.0, group=GRP_RISK)
+
+default_tp_pips = input.float(
+     50.0, title="TP par défaut (pips)",
+     minval=10.0, maxval=300.0, step=5.0, group=GRP_RISK,
+     tooltip="Doit rester ≥ 2× le SL pour passer le filtre RR du bot")
+
+// Affichage
+show_swings     = input.bool(true,  title="Afficher niveaux swing",   group=GRP_DISPLAY)
+show_ema        = input.bool(true,  title="Afficher EMA 50 (4H)",     group=GRP_DISPLAY)
+show_bos_lines  = input.bool(true,  title="Afficher lignes BOS",      group=GRP_DISPLAY)
+show_range_box  = input.bool(true,  title="Afficher boîte range",     group=GRP_DISPLAY)
+show_labels     = input.bool(true,  title="Afficher labels signaux",  group=GRP_DISPLAY)
+
+// Webhook
+secret_key = input.string(
+     "VOTRE_CLE_SECRETE", title="Clé secrète webhook",
+     group=GRP_WEBHOOK,
+     tooltip="Valeur de WEBHOOK_SECRET_KEY dans votre fichier .env sur le VPS")
+
+symbol_override = input.string(
+     "EURUSD", title="Symbole (format broker MT5)",
+     group=GRP_WEBHOOK,
+     tooltip="Doit correspondre exactement au symbole dans MT5 : EURUSD, NAS100, XAGUSD")
+
+// ============================================================
+// SECTION 2 — CONSTANTES ET UTILITAIRES
+// ============================================================
+
+// Facteur pip pour EURUSD (1 pip = 0.0001 = 10 points)
+// Pour NAS100 : 1 pip = 1.0 point — adapter si multi-actif
+PIP = syminfo.mintick * 10
+
+// Conversion pips → prix
+f_pips_to_price(pips) =>
+    pips * PIP
+
+// Conversion prix → pips (arrondi à 1 décimale)
+f_price_to_pips(price_diff) =>
+    math.round(math.abs(price_diff) / PIP, 1)
+
+// Timestamp ISO 8601 UTC — format attendu par le bot
+// TradingView fournit timenow en millisecondes Unix
+f_timestamp() =>
+    str.format_time(timenow, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
+
+// Session active : retourne "london", "ny" ou "none"
+// Heures UTC : London 08:00-11:00 / NY 14:30-17:00
+f_session() =>
+    h = hour(timenow, "UTC")
+    m = minute(timenow, "UTC")
+    total_minutes = h * 60 + m
+    london_start = 8 * 60        // 08:00 UTC
+    london_end   = 11 * 60       // 11:00 UTC
+    ny_start     = 14 * 60 + 30  // 14:30 UTC
+    ny_end        = 17 * 60      // 17:00 UTC
+    if total_minutes >= london_start and total_minutes < london_end
+        "london"
+    else if total_minutes >= ny_start and total_minutes < ny_end
+        "ny"
+    else
+        "none"
+
+// Biais directionnel basé sur position par rapport à EMA
+f_direction(price_val, ema_val) =>
+    price_val >= ema_val ? "bull" : "bear"
+
+// ============================================================
+// SECTION 3 — EMA 50 SUR LE HTF 4H
+// ============================================================
+// security() charge les données 4H même si le graphique est en 15M.
+// lookahead=barmerge.lookahead_off évite le look-ahead biais.
+
+ema_50_4h = request.security(
+     syminfo.tickerid, "240",
+     ta.ema(close, 50),
+     lookahead=barmerge.lookahead_off
+ )
+
+// EMA locale (même timeframe) — pour affichage de référence
+ema_50_local = ta.ema(close, 50)
+
+// Tracé conditionnel
+plot(
+     show_ema ? ema_50_4h : na,
+     title    = "EMA 50 (4H)",
+     color    = color.new(color.orange, 0),
+     linewidth = 2
+ )
+
+// ============================================================
+// SECTION 4 — DÉTECTION DES SWING HIGHS / LOWS
+// ============================================================
+// ta.pivothigh/pivotlow confirment un pivot N bougies APRÈS sa formation.
+// Cela signifie qu'un signal est émis avec swing_lookback bougies de retard.
+// C'est normal et inévitable en Pine Script — le bot le sait.
+
+raw_swing_high = ta.pivothigh(high, swing_lookback, swing_lookback)
+raw_swing_low  = ta.pivotlow(low,   swing_lookback, swing_lookback)
+
+// Valeur du dernier swing confirmé (persistée entre bougies)
+var float last_swing_high = na
+var float last_swing_low  = na
+
+// Barre où le dernier swing a été détecté (pour traçage)
+var int   last_swing_high_bar = na
+var int   last_swing_low_bar  = na
+
+if not na(raw_swing_high)
+    last_swing_high     := raw_swing_high
+    last_swing_high_bar := bar_index - swing_lookback  // position réelle du pivot
+
+if not na(raw_swing_low)
+    last_swing_low     := raw_swing_low
+    last_swing_low_bar := bar_index - swing_lookback
+
+// Affichage des niveaux swing (lignes horizontales)
+if show_swings and not na(raw_swing_high)
+    line.new(
+         bar_index - swing_lookback, raw_swing_high,
+         bar_index, raw_swing_high,
+         color=color.new(color.red, 50), style=line.style_dotted, width=1
+     )
+
+if show_swings and not na(raw_swing_low)
+    line.new(
+         bar_index - swing_lookback, raw_swing_low,
+         bar_index, raw_swing_low,
+         color=color.new(color.green, 50), style=line.style_dotted, width=1
+     )
+
+// ============================================================
+// SECTION 5 — SWEEP HIGH / SWEEP LOW
+// ============================================================
+// Logique SWEEP_HIGH :
+//   1. Le high de la bougie actuelle dépasse last_swing_high + buffer
+//   2. La bougie clôture EN DESSOUS du swing high (rejection)
+//   → Le prix a chassé les longs puis est revenu : signal bear
+
+sweep_buffer = f_pips_to_price(sweep_buffer_pips)
+
+// Condition SWEEP_HIGH
+sweep_high_cond = not na(last_swing_high)
+     and high > last_swing_high + sweep_buffer   // dépassement du swing
+     and close < last_swing_high                  // clôture sous le swing (rejection)
+     and close < open                             // bougie baissière (confirmation)
+
+// Condition SWEEP_LOW
+sweep_low_cond = not na(last_swing_low)
+     and low < last_swing_low - sweep_buffer      // dépassement du swing
+     and close > last_swing_low                   // clôture au-dessus du swing (rejection)
+     and close > open                             // bougie haussière (confirmation)
+
+// Calcul SL/TP pour sweeps
+// SL : au-delà du point extrême du sweep + buffer
+// TP : RR 1:2.5 minimum pour passer le filtre bot (min 2.0)
+sweep_high_sl = f_price_to_pips(high - last_swing_high + sweep_buffer * 2)
+sweep_high_tp = math.max(sweep_high_sl * 2.5, default_tp_pips)
+
+sweep_low_sl  = f_price_to_pips(last_swing_low - low + sweep_buffer * 2)
+sweep_low_tp  = math.max(sweep_low_sl * 2.5, default_tp_pips)
+
+// Affichage signaux sweep
+if sweep_high_cond and show_labels
+    label.new(
+         bar_index, high,
+         text   = "SWEEP H\n" + str.tostring(math.round(sweep_high_sl, 1)) + "p SL",
+         style  = label.style_label_down,
+         color  = color.new(color.red, 10),
+         textcolor = color.white,
+         size   = size.small
+     )
+
+if sweep_low_cond and show_labels
+    label.new(
+         bar_index, low,
+         text   = "SWEEP L\n" + str.tostring(math.round(sweep_low_sl, 1)) + "p SL",
+         style  = label.style_label_up,
+         color  = color.new(color.green, 10),
+         textcolor = color.white,
+         size   = size.small
+     )
+
+plotshape(
+     sweep_high_cond,
+     title    = "Sweep High signal",
+     style    = shape.triangledown,
+     location = location.abovebar,
+     color    = color.red,
+     size     = size.normal
+ )
+
+plotshape(
+     sweep_low_cond,
+     title    = "Sweep Low signal",
+     style    = shape.triangleup,
+     location = location.belowbar,
+     color    = color.green,
+     size     = size.normal
+ )
+
+// ============================================================
+// SECTION 6 — BREAK OF STRUCTURE (BOS)
+// ============================================================
+// BOS_BULL : la bougie actuelle clôture AU-DESSUS du swing high de référence
+//            → structure de marché brisée vers le haut (Higher High confirmé)
+//
+// BOS_BEAR : la bougie actuelle clôture EN DESSOUS du swing low de référence
+//            → structure de marché brisée vers le bas (Lower Low confirmé)
+//
+// Différence avec sweep : le BOS est une clôture franche au-delà du niveau,
+// sans nécessairement de rejection sur la même bougie.
+
+// Swing de référence pour le BOS : le plus récent dans la fenêtre bos_lookback
+bos_ref_high = ta.highest(high, bos_lookback)[1]  // [1] = exclut la bougie actuelle
+bos_ref_low  = ta.lowest(low,  bos_lookback)[1]
+
+// BOS_BULL : clôture au-dessus du plus haut récent
+bos_bull_cond = close > bos_ref_high
+     and close[1] <= bos_ref_high  // la bougie précédente était encore en dessous
+     and not sweep_low_cond        // pas un double-comptage avec sweep
+
+// BOS_BEAR : clôture en dessous du plus bas récent
+bos_bear_cond = close < bos_ref_low
+     and close[1] >= bos_ref_low   // la bougie précédente était encore au-dessus
+     and not sweep_high_cond       // pas un double-comptage avec sweep
+
+// SL/TP pour BOS
+// SL : sous/sur le niveau cassé + buffer
+bos_bull_sl = f_price_to_pips(close - bos_ref_high) + sweep_buffer_pips + default_sl_pips
+bos_bear_sl = f_price_to_pips(bos_ref_low - close) + sweep_buffer_pips + default_sl_pips
+bos_bull_tp = math.max(bos_bull_sl * 2.5, default_tp_pips)
+bos_bear_tp = math.max(bos_bear_sl * 2.5, default_tp_pips)
+
+// Tracé ligne BOS
+if bos_bull_cond and show_bos_lines
+    line.new(
+         bar_index - 1, bos_ref_high,
+         bar_index,     bos_ref_high,
+         color=color.new(color.blue, 20), style=line.style_dashed, width=2
+     )
+    if show_labels
+        label.new(
+             bar_index, low,
+             text   = "BOS ▲\n" + str.tostring(math.round(bos_bull_sl, 1)) + "p SL",
+             style  = label.style_label_up,
+             color  = color.new(color.blue, 10),
+             textcolor = color.white,
+             size   = size.small
+         )
+
+if bos_bear_cond and show_bos_lines
+    line.new(
+         bar_index - 1, bos_ref_low,
+         bar_index,     bos_ref_low,
+         color=color.new(color.purple, 20), style=line.style_dashed, width=2
+     )
+    if show_labels
+        label.new(
+             bar_index, high,
+             text   = "BOS ▼\n" + str.tostring(math.round(bos_bear_sl, 1)) + "p SL",
+             style  = label.style_label_down,
+             color  = color.new(color.purple, 10),
+             textcolor = color.white,
+             size   = size.small
+         )
+
+plotshape(
+     bos_bull_cond,
+     title    = "BOS Bull signal",
+     style    = shape.labelup,
+     location = location.belowbar,
+     color    = color.blue,
+     size     = size.small
+ )
+
+plotshape(
+     bos_bear_cond,
+     title    = "BOS Bear signal",
+     style    = shape.labeldown,
+     location = location.abovebar,
+     color    = color.purple,
+     size     = size.small
+ )
+
+// ============================================================
+// SECTION 7 — RANGE BREAKOUT
+// ============================================================
+// Détection de consolidation : une zone est un "range" si :
+//   1. L'amplitude high-low sur range_bars bougies ≥ range_min_pips
+//   2. La volatilité récente (ATR) est faible par rapport à l'ATR normal
+//   3. Le prix est contenu dans cette zone depuis range_bars bougies
+//
+// Cassure : la bougie actuelle clôture hors de la zone
+
+atr_14     = ta.atr(14)
+range_high = ta.highest(high, range_bars)
+range_low  = ta.lowest(low,  range_bars)
+range_size = range_high - range_low
+range_size_pips = f_price_to_pips(range_size)
+
+// Volatilité récente vs ATR : si le range est petit par rapport à l'ATR normal,
+// c'est une vraie consolidation
+is_consolidating = range_size <= atr_14 * range_atr_ratio * range_bars
+     and range_size_pips >= range_min_pips  // range assez large pour être significatif
+
+// Cassure haussière : clôture au-dessus du range après consolidation
+range_bull_cond = is_consolidating[1]       // consolidation confirmée sur bougies précédentes
+     and close > range_high[1]             // clôture au-dessus du range
+     and close[1] <= range_high[1]         // bougie précédente était dans le range
+
+// Cassure baissière
+range_bear_cond = is_consolidating[1]
+     and close < range_low[1]
+     and close[1] >= range_low[1]
+
+// SL/TP pour range breakout
+range_bull_sl = range_size_pips + sweep_buffer_pips   // SL à l'intérieur du range
+range_bear_sl = range_size_pips + sweep_buffer_pips
+range_bull_tp = math.max(range_bull_sl * 2.5, default_tp_pips)
+range_bear_tp = math.max(range_bear_sl * 2.5, default_tp_pips)
+
+// Affichage boîte de range
+var box range_box = na
+if is_consolidating and not is_consolidating[1] and show_range_box
+    range_box := box.new(
+         bar_index - range_bars, range_high,
+         bar_index,              range_low,
+         border_color = color.new(color.yellow, 40),
+         bgcolor      = color.new(color.yellow, 85),
+         border_width = 1,
+         border_style = line.style_dashed
+     )
+
+if (range_bull_cond or range_bear_cond) and show_labels
+    label.new(
+         bar_index, range_bull_cond ? low : high,
+         text   = "RANGE BO " + (range_bull_cond ? "▲" : "▼"),
+         style  = range_bull_cond ? label.style_label_up : label.style_label_down,
+         color  = color.new(color.yellow, 10),
+         textcolor = color.black,
+         size   = size.small
+     )
+
+plotshape(
+     range_bull_cond or range_bear_cond,
+     title    = "Range Breakout signal",
+     style    = shape.diamond,
+     location = range_bull_cond ? location.belowbar : location.abovebar,
+     color    = color.yellow,
+     size     = size.normal
+ )
+
+// ============================================================
+// SECTION 8 — SESSION OPEN
+// ============================================================
+// Émis une seule fois à l'ouverture de chaque session.
+// Permet au bot de réinitialiser ses compteurs intraday.
+// Non tradeable — le bot répond ALLOW systématiquement.
+
+// Détection ouverture London (08:00 UTC) et NY (14:30 UTC)
+// On vérifie la première bougie 15M de chaque session
+is_london_open = hour(time, "UTC") == 8  and minute(time, "UTC") == 0
+is_ny_open     = hour(time, "UTC") == 14 and minute(time, "UTC") == 30
+
+session_open_cond = is_london_open or is_ny_open
+session_label     = is_london_open ? "london" : "ny"
+
+// ============================================================
+// SECTION 9 — CONSTRUCTION DES PAYLOADS JSON
+// ============================================================
+// Chaque payload respecte exactement le contrat webhook-contract.md
+// Le champ "secret" remplace le header X-Secret-Key (limitation TradingView)
+
+// Utilitaire : formate un float avec N décimales en string
+f_fmt(val, decimals) =>
+    str.tostring(math.round(val, decimals))
+
+// --- Payload SWEEP_HIGH ---
+payload_sweep_high =
+     '{'                                                                    +
+     '"secret":"'        + secret_key                            + '",'    +
+     '"event_type":"SWEEP_HIGH",'                                           +
+     '"symbol":"'        + symbol_override                       + '",'    +
+     '"timeframe":"15",'                                                    +
+     '"price":'          + f_fmt(close, 5)                       + ','     +
+     '"direction":"bear",'                                                  +
+     '"timestamp":"'     + f_timestamp()                         + '",'    +
+     '"sweep_level":'    + f_fmt(last_swing_high, 5)             + ','     +
+     '"sl_pips":'        + f_fmt(sweep_high_sl, 1)               + ','     +
+     '"tp_pips":'        + f_fmt(sweep_high_tp, 1)               + ','     +
+     '"ema_50_value":'   + f_fmt(ema_50_4h, 5)                   + ','     +
+     '"session":"'       + f_session()                           + '"'     +
+     '}'
+
+// --- Payload SWEEP_LOW ---
+payload_sweep_low =
+     '{'                                                                    +
+     '"secret":"'        + secret_key                            + '",'    +
+     '"event_type":"SWEEP_LOW",'                                            +
+     '"symbol":"'        + symbol_override                       + '",'    +
+     '"timeframe":"15",'                                                    +
+     '"price":'          + f_fmt(close, 5)                       + ','     +
+     '"direction":"bull",'                                                  +
+     '"timestamp":"'     + f_timestamp()                         + '",'    +
+     '"sweep_level":'    + f_fmt(last_swing_low, 5)              + ','     +
+     '"sl_pips":'        + f_fmt(sweep_low_sl, 1)                + ','     +
+     '"tp_pips":'        + f_fmt(sweep_low_tp, 1)                + ','     +
+     '"ema_50_value":'   + f_fmt(ema_50_4h, 5)                   + ','     +
+     '"session":"'       + f_session()                           + '"'     +
+     '}'
+
+// --- Payload BOS_BULL ---
+payload_bos_bull =
+     '{'                                                                    +
+     '"secret":"'        + secret_key                            + '",'    +
+     '"event_type":"BOS_BULL",'                                             +
+     '"symbol":"'        + symbol_override                       + '",'    +
+     '"timeframe":"15",'                                                    +
+     '"price":'          + f_fmt(close, 5)                       + ','     +
+     '"direction":"bull",'                                                  +
+     '"timestamp":"'     + f_timestamp()                         + '",'    +
+     '"sl_pips":'        + f_fmt(bos_bull_sl, 1)                 + ','     +
+     '"tp_pips":'        + f_fmt(bos_bull_tp, 1)                 + ','     +
+     '"ema_50_value":'   + f_fmt(ema_50_4h, 5)                   + ','     +
+     '"session":"'       + f_session()                           + '"'     +
+     '}'
+
+// --- Payload BOS_BEAR ---
+payload_bos_bear =
+     '{'                                                                    +
+     '"secret":"'        + secret_key                            + '",'    +
+     '"event_type":"BOS_BEAR",'                                             +
+     '"symbol":"'        + symbol_override                       + '",'    +
+     '"timeframe":"15",'                                                    +
+     '"price":'          + f_fmt(close, 5)                       + ','     +
+     '"direction":"bear",'                                                  +
+     '"timestamp":"'     + f_timestamp()                         + '",'    +
+     '"sl_pips":'        + f_fmt(bos_bear_sl, 1)                 + ','     +
+     '"tp_pips":'        + f_fmt(bos_bear_tp, 1)                 + ','     +
+     '"ema_50_value":'   + f_fmt(ema_50_4h, 5)                   + ','     +
+     '"session":"'       + f_session()                           + '"'     +
+     '}'
+
+// --- Payload SESSION_OPEN ---
+payload_session_open =
+     '{'                                                                    +
+     '"secret":"'        + secret_key                            + '",'    +
+     '"event_type":"SESSION_OPEN",'                                         +
+     '"symbol":"'        + symbol_override                       + '",'    +
+     '"timeframe":"4H",'                                                    +
+     '"price":'          + f_fmt(close, 5)                       + ','     +
+     '"direction":"'     + f_direction(close, ema_50_4h)         + '",'    +
+     '"timestamp":"'     + f_timestamp()                         + '",'    +
+     '"ema_50_value":'   + f_fmt(ema_50_4h, 5)                   + ','     +
+     '"session":"'       + session_label                         + '"'     +
+     '}'
+
+// --- Payload RANGE_BREAKOUT ---
+range_bo_dir      = range_bull_cond ? "bull" : "bear"
+range_bo_sl       = range_bull_cond ? range_bull_sl : range_bear_sl
+range_bo_tp       = range_bull_cond ? range_bull_tp : range_bear_tp
+
+payload_range_breakout =
+     '{'                                                                    +
+     '"secret":"'        + secret_key                            + '",'    +
+     '"event_type":"RANGE_BREAKOUT",'                                       +
+     '"symbol":"'        + symbol_override                       + '",'    +
+     '"timeframe":"15",'                                                    +
+     '"price":'          + f_fmt(close, 5)                       + ','     +
+     '"direction":"'     + range_bo_dir                          + '",'    +
+     '"timestamp":"'     + f_timestamp()                         + '",'    +
+     '"range_high":'     + f_fmt(range_high[1], 5)               + ','     +
+     '"range_low":'      + f_fmt(range_low[1], 5)                + ','     +
+     '"sl_pips":'        + f_fmt(range_bo_sl, 1)                 + ','     +
+     '"tp_pips":'        + f_fmt(range_bo_tp, 1)                 + ','     +
+     '"ema_50_value":'   + f_fmt(ema_50_4h, 5)                   + ','     +
+     '"session":"'       + f_session()                           + '"'     +
+     '}'
+
+// ============================================================
+// SECTION 10 — DÉCLENCHEMENT DES ALERTES
+// ============================================================
+// Chaque alertcondition correspond à un événement distinct.
+// Dans TradingView, créer UNE alerte par condition avec :
+//   - Webhook URL : https://{VPS_HOST}:8000/webhook
+//   - Message : laisser vide (le payload est passé via alertcondition)
+//
+// ATTENTION : le message de l'alerte doit être configuré avec
+// la variable correspondante dans le champ "Message" de l'alerte.
+// Coller le texte de la variable payload_XXX dans ce champ.
+//
+// Ou utiliser la variable dynamique {{plot_0}} si disponible,
+// mais la méthode recommandée est le champ Message custom.
+
+alertcondition(
+     sweep_high_cond,
+     title   = "🔴 SWEEP_HIGH — Signal Bear",
+     message = "Sweep High détecté sur EURUSD 15M. Configurer le message avec le payload JSON SWEEP_HIGH."
+ )
+
+alertcondition(
+     sweep_low_cond,
+     title   = "🟢 SWEEP_LOW — Signal Bull",
+     message = "Sweep Low détecté sur EURUSD 15M. Configurer le message avec le payload JSON SWEEP_LOW."
+ )
+
+alertcondition(
+     bos_bull_cond,
+     title   = "🔵 BOS_BULL — Break of Structure Haussier",
+     message = "BOS Bull détecté sur EURUSD 15M. Configurer le message avec le payload JSON BOS_BULL."
+ )
+
+alertcondition(
+     bos_bear_cond,
+     title   = "🟣 BOS_BEAR — Break of Structure Baissier",
+     message = "BOS Bear détecté sur EURUSD 15M. Configurer le message avec le payload JSON BOS_BEAR."
+ )
+
+alertcondition(
+     session_open_cond,
+     title   = "⏰ SESSION_OPEN — Ouverture de session",
+     message = "Session open détectée. Configurer le message avec le payload JSON SESSION_OPEN."
+ )
+
+alertcondition(
+     range_bull_cond or range_bear_cond,
+     title   = "🟡 RANGE_BREAKOUT — Cassure de range",
+     message = "Range Breakout détecté sur EURUSD 15M. Configurer le message avec le payload JSON RANGE_BREAKOUT."
+ )
+
+// ============================================================
+// SECTION 11 — GUIDE DE CONFIGURATION DES ALERTES TRADINGVIEW
+// ============================================================
+//
+// Pour chaque alertcondition ci-dessus, créer une alerte dans TV avec :
+//
+// [1] Cliquer sur l'icône "Alerte" (réveil) dans TradingView
+// [2] Condition : sélectionner "SMC Detector v1" puis l'événement voulu
+// [3] Options : "Une fois par bougie" recommandé pour éviter les doublons
+// [4] Webhook URL : https://{VPS_HOST}:8000/webhook
+// [5] Message : coller le payload JSON correspondant ci-dessous
+//
+// ─── Message pour SWEEP_HIGH ───────────────────────────────
+// {"secret":"VOTRE_CLE_SECRETE","event_type":"SWEEP_HIGH","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bear","timestamp":"{{timenow}}","sweep_level":{{plot_0}},"sl_pips":20,"tp_pips":50,"ema_50_value":{{plot_1}},"session":"london"}
+//
+// ─── Message pour SWEEP_LOW ────────────────────────────────
+// {"secret":"VOTRE_CLE_SECRETE","event_type":"SWEEP_LOW","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bull","timestamp":"{{timenow}}","sweep_level":{{plot_0}},"sl_pips":20,"tp_pips":50,"ema_50_value":{{plot_1}},"session":"london"}
+//
+// ─── Message pour BOS_BULL ─────────────────────────────────
+// {"secret":"VOTRE_CLE_SECRETE","event_type":"BOS_BULL","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bull","timestamp":"{{timenow}}","sl_pips":15,"tp_pips":40,"ema_50_value":{{plot_1}},"session":"london"}
+//
+// ─── Message pour BOS_BEAR ─────────────────────────────────
+// {"secret":"VOTRE_CLE_SECRETE","event_type":"BOS_BEAR","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bear","timestamp":"{{timenow}}","sl_pips":15,"tp_pips":40,"ema_50_value":{{plot_1}},"session":"london"}
+//
+// ─── Message pour SESSION_OPEN ─────────────────────────────
+// {"secret":"VOTRE_CLE_SECRETE","event_type":"SESSION_OPEN","symbol":"EURUSD","timeframe":"4H","price":{{close}},"direction":"bull","timestamp":"{{timenow}}","ema_50_value":{{plot_1}},"session":"london"}
+//
+// ─── Message pour RANGE_BREAKOUT ───────────────────────────
+// {"secret":"VOTRE_CLE_SECRETE","event_type":"RANGE_BREAKOUT","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bull","timestamp":"{{timenow}}","range_high":{{plot_2}},"range_low":{{plot_3}},"sl_pips":25,"tp_pips":60,"ema_50_value":{{plot_1}},"session":"london"}
+//
+// NOTE sur {{timenow}} : TradingView envoie un timestamp Unix en ms.
+//   Le bot Python le convertit automatiquement en ISO 8601 UTC.
+//   Alternativement, remplacer par la date fixe au moment de la config.
+//
+// NOTE sur "session" : le champ est statique dans le message template.
+//   Pour le rendre dynamique, dupliquer l'alerte en "london" et "ny"
+//   et activer chaque alerte uniquement pendant la session correspondante.
+//   Le bot filtre de toute façon par heure UTC — la valeur est indicative.
+//
+// ============================================================
+// VARIABLES EXPORTÉES POUR LES TEMPLATES {{plot_N}}
+// (utilisables dans le champ Message des alertes TradingView)
+// ============================================================
+
+// plot_0 : dernier swing high (sweep_level pour SWEEP_HIGH)
+plot(last_swing_high, title="[export] Last Swing High", display=display.none)
+
+// plot_1 : EMA 50 sur 4H
+plot(ema_50_4h, title="[export] EMA 50 4H", display=display.none)
+
+// plot_2 : Range High (pour RANGE_BREAKOUT)
+plot(range_high, title="[export] Range High", display=display.none)
+
+// plot_3 : Range Low (pour RANGE_BREAKOUT)
+plot(range_low, title="[export] Range Low", display=display.none)
+
+// plot_4 : dernier swing low (sweep_level pour SWEEP_LOW)
+plot(last_swing_low, title="[export] Last Swing Low", display=display.none)

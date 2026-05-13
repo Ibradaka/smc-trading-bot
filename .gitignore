@@ -1,0 +1,30 @@
+# Variables d'environnement — ne jamais committer
+.env
+
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs du bot
+bot/logs/
+*.log
+
+# macOS
+.DS_Store
+
+# Environnement virtuel
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
