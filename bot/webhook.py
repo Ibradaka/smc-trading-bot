@@ -175,6 +175,17 @@ def _filter_validation(payload: dict) -> tuple[bool, str]:
             f"reçu : {payload['direction']}"
         )
 
+    # SL/TP obligatoires et > 0 pour tout événement tradeable
+    # (utilisés par le calcul RR, le lot size et PineConnector)
+    if payload["event_type"] in TRADEABLE_EVENTS:
+        for fld in ("sl_pips", "tp_pips"):
+            val = payload.get(fld)
+            if not isinstance(val, (int, float)) or val <= 0:
+                return False, (
+                    f"{fld} obligatoire et > 0 pour un événement tradeable "
+                    f"({payload['event_type']}), reçu : {val}"
+                )
+
     # Cohérence RANGE_BREAKOUT
     if payload["event_type"] == "RANGE_BREAKOUT":
         rh = payload.get("range_high")
@@ -288,26 +299,42 @@ async def process(payload: dict) -> dict:
             "timestamp": _now_iso(),
         }
 
-    # --- Filtre 4 : SESSION ---
-    ok, detail = session_filter.check(signal)
-    if not ok:
-        await telegram.notify_block(signal, "HORS_SESSION", detail)
-        return _block(signal_id, signal, "HORS_SESSION", detail, filters_passed)
-    filters_passed.append("SESSION")
+    # --- Mode pre-filtre ---------------------------------------------------
+    # Si le payload porte "prefiltered": true, le signal vient d'une STRATEGIE
+    # complete (Pine v13/v10) qui applique deja session + EMA HTF + RR en
+    # interne. Le bot ne re-decide pas — il saute SESSION/EMA/RR et garde
+    # uniquement la securite portefeuille (RISK).
+    # Sinon : pipeline classique (ancien modele detecteur d'evenements).
+    prefiltered = bool(signal.get("prefiltered", False))
 
-    # --- Filtre 5 : EMA ---
-    ok, detail = structure_filter.check_ema(signal)
-    if not ok:
-        await telegram.notify_block(signal, "EMA_CONTRAIRE", detail)
-        return _block(signal_id, signal, "EMA_CONTRAIRE", detail, filters_passed)
-    filters_passed.append("EMA")
+    if prefiltered:
+        logger.info(
+            "Signal PRE-FILTRE | id=%s | %s | %s — SESSION/EMA/RR sautes "
+            "(strategie complete), RISK conserve",
+            signal_id, signal["event_type"], signal["symbol"],
+        )
+        filters_passed.extend(["SESSION", "EMA", "RR"])
+    else:
+        # --- Filtre 4 : SESSION ---
+        ok, detail = session_filter.check(signal)
+        if not ok:
+            await telegram.notify_block(signal, "HORS_SESSION", detail)
+            return _block(signal_id, signal, "HORS_SESSION", detail, filters_passed)
+        filters_passed.append("SESSION")
 
-    # --- Filtre 6 : RR ---
-    ok, detail = structure_filter.check_rr(signal)
-    if not ok:
-        await telegram.notify_block(signal, "RR_INSUFFISANT", detail)
-        return _block(signal_id, signal, "RR_INSUFFISANT", detail, filters_passed)
-    filters_passed.append("RR")
+        # --- Filtre 5 : EMA ---
+        ok, detail = structure_filter.check_ema(signal)
+        if not ok:
+            await telegram.notify_block(signal, "EMA_CONTRAIRE", detail)
+            return _block(signal_id, signal, "EMA_CONTRAIRE", detail, filters_passed)
+        filters_passed.append("EMA")
+
+        # --- Filtre 6 : RR ---
+        ok, detail = structure_filter.check_rr(signal)
+        if not ok:
+            await telegram.notify_block(signal, "RR_INSUFFISANT", detail)
+            return _block(signal_id, signal, "RR_INSUFFISANT", detail, filters_passed)
+        filters_passed.append("RR")
 
     # --- Filtre 7 : RISK (drawdown + trades ouverts) ---
     ok, detail = risk_state.check(signal)
