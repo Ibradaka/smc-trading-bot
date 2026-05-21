@@ -42,26 +42,22 @@ SESSIONS = {
 # Allowed Assets
 # ---------------------------------------------------------------------------
 
+# Noms = ceux du broker Switch Markets (suffixe "s" obligatoire, verifies dans MT5)
 ALLOWED_SYMBOLS = {
-    "EURUSD": {
+    "EURUSDs": {
         "priority": "high",
         "sessions": ["london", "ny"],
         "pip_value_per_lot": 10.0,   # USD per pip for 1 standard lot
     },
-    "XAUUSD": {
+    "XAUUSDs": {
         "priority": "high",
         "sessions": ["london", "ny"],
         "pip_value_per_lot": 10.0,   # 100 oz/lot x 0.1$/pip = 10$/pip/lot
     },
-    "NAS100": {
+    "USTECs": {
         "priority": "medium",
         "sessions": ["ny"],
-        "pip_value_per_lot": 1.0,    # 1 contrat x 1 point = 1$/point/lot
-    },
-    "XAGUSD": {
-        "priority": "low",
-        "sessions": ["london"],
-        "pip_value_per_lot": 50.0,
+        "pip_value_per_lot": 1.0,    # US Tech 100 — 1 contrat x 1 point = 1$/point/lot
     },
 }
 

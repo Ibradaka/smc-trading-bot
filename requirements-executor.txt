@@ -1,0 +1,10 @@
+# Dependances de l'executor MT5 — A INSTALLER SUR LA MACHINE WINDOWS
+# (celle qui heberge MetaTrader 5 : PC en test, VPS Switch Markets en prod)
+#
+# Installation :  pip install -r requirements-executor.txt
+#
+MetaTrader5
+fastapi
+uvicorn
+pydantic
+httpx

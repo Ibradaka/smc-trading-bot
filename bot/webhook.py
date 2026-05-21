@@ -29,7 +29,7 @@ from config.settings import (
 )
 from bot.filters import session_filter, structure_filter
 from bot.filters.risk_filter import risk_state
-from bot.execution import pineconnector
+from bot.execution import mt5_forwarder
 from bot.notifications import telegram
 
 logger = logging.getLogger(__name__)
@@ -350,17 +350,17 @@ async def process(payload: dict) -> dict:
     filters_passed.append("RISK")
 
     # --- Tous les filtres passés → ALLOW ---
-    success, cmd, lot_size, err = await pineconnector.send_order(signal)
+    success, cmd, lot_size, err = await mt5_forwarder.send_order(signal)
 
     if not success:
-        # Erreur technique PineConnector → bloquer par sécurité
+        # Erreur technique executor MT5 → bloquer par sécurité
         await telegram.notify_error(
-            context=f"PineConnector — {signal['event_type']} {signal['symbol']}",
+            context=f"Executor MT5 — {signal['event_type']} {signal['symbol']}",
             error=err,
         )
         return _block(
             signal_id, signal, "ERREUR_TECHNIQUE",
-            f"PineConnector n'a pas répondu correctement : {err}",
+            f"L'executor MT5 n'a pas placé l'ordre : {err}",
             filters_passed,
         )
 

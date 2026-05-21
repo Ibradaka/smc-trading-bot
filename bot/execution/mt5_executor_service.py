@@ -1,0 +1,230 @@
+"""
+SMC MT5 Executor Service
+========================
+Tourne sur la machine Windows qui heberge MetaTrader 5 (PC en test, VPS en prod).
+Recoit les ordres du bot via HTTP et les place avec le package officiel MetaTrader5.
+Remplace PineConnector — gratuit, sans intermediaire.
+
+PREREQUIS (machine Windows) :
+  - MetaTrader 5 installe, OUVERT et connecte au compte
+  - pip install MetaTrader5 fastapi uvicorn httpx
+
+LANCER :
+  python bot/execution/mt5_executor_service.py
+  (ecoute sur le port 9000)
+
+VARIABLES D'ENVIRONNEMENT (optionnelles) :
+  MT5_EXECUTOR_SECRET : cle partagee avec le bot (auth des requetes)
+  MT5_EXECUTOR_PORT   : port d'ecoute (defaut 9000)
+  MT5_LOGIN / MT5_PASSWORD / MT5_SERVER : si presents -> auto-login MT5
+"""
+
+import logging
+import os
+
+import MetaTrader5 as mt5
+import uvicorn
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("mt5_executor")
+
+# --- Configuration ---------------------------------------------------------
+
+EXECUTOR_SECRET = os.environ.get("MT5_EXECUTOR_SECRET", "")
+EXECUTOR_PORT   = int(os.environ.get("MT5_EXECUTOR_PORT", "9000"))
+MT5_LOGIN       = os.environ.get("MT5_LOGIN", "")
+MT5_PASSWORD    = os.environ.get("MT5_PASSWORD", "")
+MT5_SERVER      = os.environ.get("MT5_SERVER", "")
+
+MAGIC = 13013   # identifiant des ordres places par ce bot (visible dans MT5)
+
+# Taille d'un "pip" par symbole — DOIT matcher le 'pip' hardcode des scripts Pine
+PIP_SIZE = {
+    "XAUUSDs": 0.1,
+    "EURUSDs": 0.0001,
+    "USTECs":  1.0,
+}
+
+app = FastAPI(title="SMC MT5 Executor")
+
+
+# --- Connexion MT5 ---------------------------------------------------------
+
+def ensure_mt5() -> tuple[bool, str]:
+    """Garantit une connexion MT5 active. (Re)initialise si besoin."""
+    if mt5.terminal_info() is not None:
+        return True, ""
+    if MT5_LOGIN and MT5_PASSWORD and MT5_SERVER:
+        ok = mt5.initialize(login=int(MT5_LOGIN), password=MT5_PASSWORD, server=MT5_SERVER)
+    else:
+        ok = mt5.initialize()
+    if not ok:
+        return False, f"mt5.initialize() echec : {mt5.last_error()}"
+    return True, ""
+
+
+# --- Modele de requete -----------------------------------------------------
+
+class OrderRequest(BaseModel):
+    secret: str
+    symbol: str
+    direction: str          # "bull" ou "bear"
+    lot: float
+    sl_pips: float
+    tp_pips: float
+    comment: str = "SMC bot"
+
+
+# --- Endpoints -------------------------------------------------------------
+
+@app.get("/health")
+def health():
+    """Verifie que MT5 repond — pour le monitoring."""
+    ok, err = ensure_mt5()
+    acc = mt5.account_info() if ok else None
+    return {
+        "status":  "ok" if ok else "mt5_down",
+        "error":   err,
+        "account": acc.login if acc else None,
+        "balance": acc.balance if acc else None,
+    }
+
+
+@app.post("/order")
+def place_order(req: OrderRequest):
+    """Place un ordre marche avec SL et TP sur le compte MT5 connecte."""
+
+    # 1. Authentification
+    if not EXECUTOR_SECRET or req.secret != EXECUTOR_SECRET:
+        logger.warning("Requete refusee : secret invalide")
+        return {"success": False, "error": "secret invalide"}
+
+    # 2. Connexion MT5
+    ok, err = ensure_mt5()
+    if not ok:
+        return {"success": False, "error": err}
+
+    symbol = req.symbol
+
+    # 3. Symbole present dans le Market Watch
+    if not mt5.symbol_select(symbol, True):
+        return {"success": False, "error": f"symbole {symbol} introuvable chez le broker"}
+
+    info = mt5.symbol_info(symbol)
+    tick = mt5.symbol_info_tick(symbol)
+    if info is None or tick is None:
+        return {"success": False, "error": f"pas de cotation pour {symbol}"}
+
+    pip = PIP_SIZE.get(symbol)
+    if pip is None:
+        return {"success": False, "error": f"PIP_SIZE non defini pour {symbol}"}
+
+    # 4. Sens, prix d'entree, SL, TP
+    is_buy     = req.direction == "bull"
+    order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
+    price      = tick.ask if is_buy else tick.bid
+
+    sl_dist = req.sl_pips * pip
+    tp_dist = req.tp_pips * pip
+    sl = price - sl_dist if is_buy else price + sl_dist
+    tp = price + tp_dist if is_buy else price - tp_dist
+
+    digits = info.digits
+    price = round(price, digits)
+    sl    = round(sl, digits)
+    tp    = round(tp, digits)
+
+    # 5. Volume cale sur le pas du broker (volume_step)
+    step = info.volume_step or 0.01
+    lot  = round(req.lot / step) * step
+    lot  = max(info.volume_min, min(lot, info.volume_max))
+    lot  = round(lot, 2)
+
+    # 6. Mode de remplissage — determine d'apres la spec du symbole.
+    # info.filling_mode est un bitmask : bit 1 = FOK autorise, bit 2 = IOC autorise.
+    fm = info.filling_mode
+    fill_order = []
+    if fm & 2:
+        fill_order.append(mt5.ORDER_FILLING_IOC)
+    if fm & 1:
+        fill_order.append(mt5.ORDER_FILLING_FOK)
+    # filet de securite : on tente aussi les autres modes
+    for extra in (mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN):
+        if extra not in fill_order:
+            fill_order.append(extra)
+
+    sym_diag = (f"filling_mode={fm}, trade_mode={info.trade_mode}, "
+                f"exemode={info.trade_exemode}, vol_min={info.volume_min}, "
+                f"vol_step={info.volume_step}")
+
+    base = {
+        "action":    mt5.TRADE_ACTION_DEAL,
+        "symbol":    symbol,
+        "volume":    lot,
+        "type":      order_type,
+        "price":     price,
+        "sl":        sl,
+        "tp":        tp,
+        "deviation": 30,
+        "magic":     MAGIC,
+        "comment":   req.comment[:31],
+        "type_time": mt5.ORDER_TIME_GTC,
+    }
+
+    # 7. Envoi — tente chaque mode de remplissage jusqu'au succes
+    result = None
+    attempts = []
+    for filling in fill_order:
+        result = mt5.order_send(dict(base, type_filling=filling))
+        rc = result.retcode if result is not None else "None"
+        attempts.append(f"fill{filling}->{rc}")
+        if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+            break
+
+    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        rc = result.retcode if result else "None"
+        cm = result.comment if result else str(mt5.last_error())
+        logger.warning("Ordre %s rejete : retcode=%s | %s | tentatives=%s",
+                        symbol, rc, sym_diag, attempts)
+        return {
+            "success":  False,
+            "error":    f"ordre rejete (retcode {rc}) : {cm}",
+            "diag":     sym_diag,
+            "attempts": attempts,
+        }
+
+    logger.info("Ordre place : %s %s lot=%.2f ticket=%s prix=%s sl=%s tp=%s",
+                req.direction, symbol, lot, result.order, result.price, sl, tp)
+    return {
+        "success":   True,
+        "ticket":    result.order,
+        "symbol":    symbol,
+        "direction": req.direction,
+        "volume":    result.volume,
+        "price":     result.price,
+        "sl":        sl,
+        "tp":        tp,
+    }
+
+
+if __name__ == "__main__":
+    logger.info("Demarrage SMC MT5 Executor — port %d", EXECUTOR_PORT)
+    started, err = ensure_mt5()
+    if started:
+        acc = mt5.account_info()
+        logger.info("MT5 connecte — compte %s, solde %.2f %s",
+                    acc.login if acc else "?",
+                    acc.balance if acc else 0,
+                    acc.currency if acc else "")
+    else:
+        logger.warning("MT5 pas encore connecte : %s "
+                        "(verifie que le terminal MT5 est ouvert et connecte)", err)
+    if not EXECUTOR_SECRET:
+        logger.warning("MT5_EXECUTOR_SECRET non defini — toute requete sera refusee. "
+                        "Definis-le avant utilisation reelle.")
+    uvicorn.run(app, host="0.0.0.0", port=EXECUTOR_PORT)
