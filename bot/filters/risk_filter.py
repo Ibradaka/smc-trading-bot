@@ -8,7 +8,7 @@ Maintient l'état interne du bot (en mémoire, réinitialisé au redémarrage) :
   - Timestamp de fin de pause weekly (si active)
 
 Règles appliquées :
-  1. MAX_TRADES_ATTEINT   → 2 trades simultanés ouverts
+  1. MAX_TRADES_ATTEINT   → 3 trades simultanés ouverts
   2. DAILY_DD_ATTEINT     → perte du jour ≥ 90 € (3% de 3000 €)
   3. WEEKLY_DD_ATTEINT    → perte de la semaine ≥ 180 € (6%) ou pause active
 
@@ -111,8 +111,25 @@ class RiskState:
 
     def trade_opened(self) -> None:
         """Incrémenter le compteur de trades ouverts."""
-        self._open_trades = min(self._open_trades + 1, MAX_TRADES)
+        self._open_trades = self._open_trades + 1
         logger.info("Trade ouvert — trades actifs : %d", self._open_trades)
+
+    def sync_open_trades(self, count: int) -> None:
+        """
+        Resynchronise le compteur sur la réalité MT5 (réconciliation).
+
+        MT5 ne notifie pas le bot quand un trade se ferme (TP/SL touché) :
+        sans ça le compteur ne redescend jamais et finit par bloquer tous
+        les signaux. Appelé avant le filtre RISK avec le nombre réel de
+        positions ouvertes (magic 13013) renvoyé par l'executor.
+        """
+        count = max(0, int(count))
+        if count != self._open_trades:
+            logger.info(
+                "Réconciliation — trades ouverts : %d -> %d (réalité MT5)",
+                self._open_trades, count,
+            )
+        self._open_trades = count
 
     def trade_closed(self, pnl_eur: float) -> None:
         """

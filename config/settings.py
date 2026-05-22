@@ -11,7 +11,7 @@ from datetime import time
 
 INITIAL_CAPITAL = 3000.0       # EUR
 RISK_PCT = 0.01                # 1% risk per trade
-MAX_TRADES = 2                 # maximum simultaneous open trades
+MAX_TRADES = 3                 # max trades simultanes (1 par actif : gold, eurusd, nasdaq)
 DAILY_DD_LIMIT = 0.03          # 3% daily drawdown → bot stops
 WEEKLY_DD_LIMIT = 0.06         # 6% weekly drawdown → 48h forced pause
 MIN_RR = 2.0                   # minimum risk/reward ratio accepted

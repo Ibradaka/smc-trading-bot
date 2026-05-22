@@ -260,15 +260,15 @@ async def run_all_tests() -> TestResult:
     info   = f"status={result['status']} reason={result.get('reason', '-')}" if not ok else ""
     results.record("RR = 1.2 (minimum 2.0) -> BLOCK RR_INSUFFISANT", ok, info)
 
-    # Test 8 : 2 trades deja ouverts -> MAX_TRADES_ATTEINT
+    # Test 8 : 3 trades deja ouverts -> MAX_TRADES_ATTEINT (MAX_TRADES = 3)
     # Ne pas appeler run_test() (qui fait _reset_risk_state), injecter directement
     _reset_risk_state()
-    risk_state._open_trades = 2
+    risk_state._open_trades = 3
     payload = dict(BASE_VALID_PAYLOAD)
     result  = await _run_pipeline(payload, mock_time=_make_london_time())
     ok      = result["status"] == "BLOCK" and result.get("reason") == "MAX_TRADES_ATTEINT"
     info    = f"status={result['status']} reason={result.get('reason', '-')}" if not ok else ""
-    results.record("2 trades deja ouverts -> BLOCK MAX_TRADES_ATTEINT", ok, info)
+    results.record("3 trades deja ouverts -> BLOCK MAX_TRADES_ATTEINT", ok, info)
 
     # Test 9 : Drawdown jour = 95 EUR (depasse limite 90 EUR) -> DAILY_DD_ATTEINT
     _reset_risk_state()
@@ -331,10 +331,10 @@ async def run_all_tests() -> TestResult:
     results.record("SESSION_OPEN -> ALLOW sans trade (evenement de gestion)", ok, info)
 
     # -----------------------------------------------------------------------
-    # ANTI-DOUBLON & CLOTURE
+    # ANTI-DOUBLON, CLOTURE & RECONCILIATION
     # -----------------------------------------------------------------------
     print()
-    print(f"{BOLD}-- ANTI-DOUBLON & CLOTURE ---------------------------------{RESET}")
+    print(f"{BOLD}-- ANTI-DOUBLON, CLOTURE & RECONCILIATION -----------------{RESET}")
 
     # Test 14 : meme webhook envoye 2x -> 2e = BLOCK DOUBLON
     _reset_risk_state()
@@ -369,6 +369,18 @@ async def run_all_tests() -> TestResult:
     ok = result["status"] == "ALLOW" and result.get("event_type") == "CLOSE"
     info = f"status={result['status']} reason={result.get('reason', '-')}" if not ok else ""
     results.record("event CLOSE -> ALLOW (cloture forcee)", ok, info)
+
+    # Test 16 : reconciliation -> compteur resynchronise sur la realite MT5
+    # Compteur interne a 0, mais l'executor declare 3 positions ouvertes
+    # -> le bot doit se resynchroniser et bloquer (MAX_TRADES).
+    _reset_risk_state()
+    payload = dict(BASE_VALID_BOS)
+    with patch("bot.execution.mt5_forwarder.get_open_positions",
+               new=AsyncMock(return_value=3)):
+        result = await _run_pipeline(payload, mock_time=_make_london_time())
+    ok = result["status"] == "BLOCK" and result.get("reason") == "MAX_TRADES_ATTEINT"
+    info = f"status={result['status']} reason={result.get('reason', '-')}" if not ok else ""
+    results.record("Reconciliation : 3 positions MT5 -> BLOCK MAX_TRADES", ok, info)
 
     # -----------------------------------------------------------------------
     # SCORE FINAL

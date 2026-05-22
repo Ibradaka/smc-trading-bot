@@ -130,6 +130,10 @@ class CloseRequest(BaseModel):
     symbol: str
 
 
+class PositionsRequest(BaseModel):
+    secret: str
+
+
 # --- Endpoints -------------------------------------------------------------
 
 @app.get("/health")
@@ -334,6 +338,32 @@ def close_positions(req: CloseRequest):
 
     logger.info("Cloture %s OK — %d position(s) fermee(s)", symbol, closed)
     return {"success": True, "closed": closed, "symbol": symbol}
+
+
+@app.post("/positions")
+def open_positions(req: PositionsRequest):
+    """
+    Renvoie le nombre de positions ouvertes placees par ce bot (magic 13013).
+    Utilise par la reconciliation : le bot resynchronise son compteur de
+    trades ouverts sur cette verite MT5 avant le filtre RISK.
+    """
+    if not EXECUTOR_SECRET or req.secret != EXECUTOR_SECRET:
+        logger.warning("Requete /positions refusee : secret invalide")
+        return {"success": False, "error": "secret invalide"}
+
+    ok, err = ensure_mt5()
+    if not ok:
+        return {"success": False, "error": err}
+
+    positions = mt5.positions_get() or ()
+    bot_positions = [p for p in positions if p.magic == MAGIC]
+
+    return {
+        "success": True,
+        "count":   len(bot_positions),
+        "tickets": [p.ticket for p in bot_positions],
+        "symbols": [p.symbol for p in bot_positions],
+    }
 
 
 if __name__ == "__main__":

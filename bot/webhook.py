@@ -418,6 +418,14 @@ async def process(payload: dict) -> dict:
             return _block(signal_id, signal, "RR_INSUFFISANT", detail, filters_passed)
         filters_passed.append("RR")
 
+    # --- Réconciliation : resynchronise le compteur de trades ouverts ---
+    # MT5 ne notifie pas la clôture d'un trade -> le compteur interne ne
+    # redescend pas seul. On interroge l'executor pour la vérité MT5 avant
+    # le filtre RISK (sinon le bot se bloque tout seul après quelques trades).
+    real_open = await mt5_forwarder.get_open_positions()
+    if real_open is not None:
+        risk_state.sync_open_trades(real_open)
+
     # --- Filtre 7 : RISK (drawdown + trades ouverts) ---
     ok, detail = risk_state.check(signal)
     if not ok:

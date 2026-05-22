@@ -134,3 +134,37 @@ async def send_close(signal: dict) -> tuple[bool, str, str]:
     err = data.get("error", f"HTTP {resp.status_code}")
     logger.error("Executor MT5 a refuse la cloture : %s", err)
     return False, "", err
+
+
+async def get_open_positions() -> int | None:
+    """
+    Nombre de positions actuellement ouvertes par le bot (magic 13013) sur MT5.
+
+    Sert a la reconciliation : MT5 ne notifie pas la cloture d'un trade, donc
+    le compteur interne du bot ne redescend pas seul. On interroge l'executor
+    pour la verite avant le filtre RISK.
+
+    Returns:
+        le nombre de positions (int), ou None si l'executor est injoignable
+        (dans ce cas le bot garde son compteur interne).
+    """
+    if not MT5_EXECUTOR_URL:
+        return None
+
+    positions_url = MT5_EXECUTOR_URL.replace("/order", "/positions")
+    payload = {"secret": MT5_EXECUTOR_SECRET}
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.post(positions_url, json=payload)
+        data = resp.json()
+    except Exception as exc:
+        logger.warning("Reconciliation : executor injoignable (%s)", exc)
+        return None
+
+    if resp.status_code == 200 and data.get("success"):
+        return int(data.get("count", 0))
+
+    logger.warning("Reconciliation : reponse executor invalide — %s",
+                   data.get("error", f"HTTP {resp.status_code}"))
+    return None
