@@ -416,13 +416,14 @@ def modify_position(req: ModifyRequest):
     for pos in bot_pos:
         is_buy = pos.type == mt5.POSITION_TYPE_BUY
 
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            errors.append(f"ticket {pos.ticket} : pas de cotation")
+            continue
+
         if req.mode == "breakeven":
             new_sl = pos.price_open + pip if is_buy else pos.price_open - pip
         elif req.mode == "trail":
-            tick = mt5.symbol_info_tick(symbol)
-            if tick is None:
-                errors.append(f"ticket {pos.ticket} : pas de cotation")
-                continue
             ref  = tick.bid if is_buy else tick.ask
             dist = req.trail_pips * pip
             new_sl = ref - dist if is_buy else ref + dist
@@ -430,6 +431,18 @@ def modify_position(req: ModifyRequest):
             return {"success": False, "error": f"mode inconnu : {req.mode}"}
 
         new_sl = round(new_sl, info.digits)
+
+        # SL valide cote marche : un SL de vente doit etre AU-DESSUS du prix,
+        # un SL d'achat EN DESSOUS (+ marge mini stops_level du broker). Sinon
+        # on ignore sans erreur — ex. break-even demande alors que le trade
+        # n'est pas encore en profit (le SL=entree serait du mauvais cote).
+        stop_buf = (info.trade_stops_level or 0) * info.point
+        if is_buy and new_sl >= tick.bid - stop_buf:
+            skipped += 1
+            continue
+        if (not is_buy) and new_sl <= tick.ask + stop_buf:
+            skipped += 1
+            continue
 
         # Garde-fou anti-recul : on n'applique que si le SL se resserre.
         cur_sl = pos.sl or 0.0
