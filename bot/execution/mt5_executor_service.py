@@ -40,6 +40,16 @@ EXECUTOR_PORT   = int(os.environ.get("MT5_EXECUTOR_PORT", "9000"))
 MT5_LOGIN       = os.environ.get("MT5_LOGIN", "")
 MT5_PASSWORD    = os.environ.get("MT5_PASSWORD", "")
 MT5_SERVER      = os.environ.get("MT5_SERVER", "")
+MT5_PATH        = os.environ.get("MT5_PATH", "")
+
+# Chemins ou MT5 peut etre installe — essayes si MT5_PATH non defini.
+# Le package MetaTrader5 ne trouve pas toujours le terminal seul (VPS, install
+# non standard) -> on lui passe le chemin explicite du terminal64.exe.
+_COMMON_MT5_PATHS = [
+    r"C:\Program Files\Switch Markets MT5\terminal64.exe",
+    r"C:\Program Files\Switch Markets MetaTrader 5\terminal64.exe",
+    r"C:\Program Files\MetaTrader 5\terminal64.exe",
+]
 
 MAGIC = 13013   # identifiant des ordres places par ce bot (visible dans MT5)
 
@@ -59,12 +69,27 @@ def ensure_mt5() -> tuple[bool, str]:
     """Garantit une connexion MT5 active. (Re)initialise si besoin."""
     if mt5.terminal_info() is not None:
         return True, ""
+
+    # Resoudre le chemin du terminal MT5 (explicite ou auto-detecte)
+    path = MT5_PATH
+    if not path:
+        for p in _COMMON_MT5_PATHS:
+            if os.path.exists(p):
+                path = p
+                break
+
+    kwargs = {}
+    if path:
+        kwargs["path"] = path
     if MT5_LOGIN and MT5_PASSWORD and MT5_SERVER:
-        ok = mt5.initialize(login=int(MT5_LOGIN), password=MT5_PASSWORD, server=MT5_SERVER)
-    else:
-        ok = mt5.initialize()
+        kwargs["login"]    = int(MT5_LOGIN)
+        kwargs["password"] = MT5_PASSWORD
+        kwargs["server"]   = MT5_SERVER
+
+    ok = mt5.initialize(**kwargs)
     if not ok:
-        return False, f"mt5.initialize() echec : {mt5.last_error()}"
+        return False, (f"mt5.initialize() echec (path={path or 'auto'}) : "
+                       f"{mt5.last_error()}")
     return True, ""
 
 
