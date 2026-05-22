@@ -1,86 +1,6 @@
 // ============================================================
-// SMC Strategy v13 NASDAQ — V13 + Trailing ATR (NAS100 / US100 edition)
+// SMC Strategy v10 — Institutional Full Stack
 // Projet   : SMC Trading Bot
-// Version  : 13.0.0-NASDAQ
-// Auteur   : Ibradaka
-// Date     : 2026-05-19
-//
-// HOTFIX anti-gap (2026-05-22) :
-//   * use_eod_flat : flat de fin de session le VENDREDI uniquement (pas tous
-//     les jours). USTECs (CFD) cote ~24h -> seul le week-end est un vrai gap.
-//   * Le flat quotidien tronquait les trailing ATR gagnants : net 117$ -> 6$.
-//     Flat vendredi seul = garde le gain de semaine + supprime le gap week-end.
-//   * Cote bot : envoi d'un event "CLOSE" au webhook quand le flat se declenche
-//     -> l'executor ferme la position live (magic 13013).
-//
-// CHANGELOG v13 NASDAQ (re-calibrage depuis v13 GOLD) :
-//   * pip              : 0.1   -> 1.0     (1 point d'indice NASDAQ)
-//   * sl_min_pips      : 50    -> 30      (30 points min)
-//   * sl_max_pips      : 500   -> 300     (300 points max)
-//   * eq_pip_tol       : 30.0  -> 15.0    (15 points tolerance EQ)
-//   * qty              : suppression de math.round -> sizing fractionnaire
-//                        clamp 0.1 - 20 (contrats CFD NAS100, 1 pt = 1$/unite)
-//   * margin_long/short: 5.0 (20:1, indices CFD)
-//   * initial_capital  : 10000
-//   * SESSIONS RETIMEES : NASDAQ = session US cash 14:30-21:00 UTC
-//     - sess_ny_open : 12:00-15:00 -> 14:30-17:00 UTC (US cash open killzone)
-//     - sess_ny_full : 12:00-17:00 -> 14:30-21:00 UTC (session US complete)
-//     - sessions EU (London) desactivees par defaut (faible volume NASDAQ)
-//
-// PREREQUIS : utiliser un symbole CFD type NAS100USD / US100 (1 pt = 1$/unite),
-//             PAS un contrat futures NQ (20$/point — sizing different).
-//
-// CHANGELOG v13 (Trailing ATR) :
-//   * Apres BE+1R : annule l'exit fixe, place un exit trailing pur (stop = close +/- 1.5xATR)
-//   * Struct exit desactive apres BE quand trailing actif
-//
-// CHANGELOG v10.2 GOLD (calibrage XAUUSD) :
-//   * sl_min_pips      : 8    -> 100  (=  10$ sur gold avec pip=0.1$)
-//   * sl_max_pips      : 35   -> 350  (=  35$ sur gold)
-//   * eq_pip_tol       : 3.0  -> 30.0 (=   3$ tolerance EQ)
-//   * qty clamps       : 1000-500000  -> 1-50 (oz)
-//   * margin_long/short: 2.0  -> 5.0  (20:1 leverage prudent pour gold)
-//   * initial_capital  : 5000 -> 10000 (gold = position size plus elevee)
-//   * Title strategy   : "SMC v10.2 GOLD"
-//
-// HOTFIX v10.2 GOLD v2 (apres 0 trade observed) :
-//   * use_dxy_filter   : true -> FALSE  (TVC:DXY parfois inaccessible -> bloquait tous longs)
-//   * use_strict_longs : true -> FALSE  (3/3 trop rare sur gold 15M, 2/3 suffit)
-//   * disp_atr_mult    : 1.3  -> 1.0    (gold 15M range moyen < 1.3xATR)
-//   * fvg_atr_mult     : 1.2  -> 0.9    (FVG gold plus petites en relatif)
-//
-// HOTFIX v10.2 GOLD v3 (toujours 0 trade apres v2) :
-//   * pip              : hardcode 0.1 (au lieu de syminfo.mintick * 10)
-//     Le mintick varie selon broker (OANDA=0.01, autres=0.001 ou 0.1)
-//     -> sl_long_pips devenait absurde -> sl_long_valid toujours FALSE
-//   * sl_min_pips      : 100  -> 50  (5$ min, plus permissif pour sweeps proches)
-//   * sl_max_pips      : 350  -> 500 (50$ max, accommode les SL larges)
-//   * Dashboard diagnostic : compteur de filtres bloquants
-//
-// UPDATE v10.2 GOLD v3.2 (DXY filter REDESACTIVE apres test v3.1) :
-//   * use_dxy_filter : true -> FALSE (revert)
-//   * Test v3.1 a coupe 10 longs dont 5 gagnants
-//   * WR longs 43.48% -> 38.46% (degradation -5 pts)
-//   * Net -236$ vs v3 (perte de 44% du net)
-//   * CAGR 11.90% -> 6.55%
-//   * Conclusion : correlation gold/DXY pas assez tight sur H4 pour filtre binaire
-//
-// CHANGELOG v10.2 :
-//   * Anti-contre-tendance LONGS : 3 nouveaux filtres dedies aux longs
-//     - use_h4_align_longs : exige EMA50 H4 > EMA200 H4 (longs only)
-//     - use_strict_longs   : exige 3/3 confirmations (FVG + OB + Liquidite)
-//     - use_dxy_filter     : exige DXY < EMA50 H4 (USD faible, longs only)
-//   * Objectif : passer WR longs 30% -> >40% en reduisant volume 23 -> 5-8 trades
-//   * Shorts inchanges (deja excellents : 7 trades, WR 57%, PF 2.4)
-//
-// CHANGELOG v10.1 :
-//   * Fix bug : break mal indenté dans la detection FVG bear (ligne 477)
-//   * Fix bug : break mal indenté dans la detection OB bear (ligne 574)
-//   * Ajout ASR comme source de liquidite (near_asr_h / near_asr_l)
-//   * Symetrie longs/shorts : liq_bull aligne sur liq_bear (sweep + EQ + PDH/PDL + ASR)
-//   * Reactivation des longs (use_longs = true) avec filtre directionnel
-//   * Ajout filtre "not short_confirmed" sur enter_long (symetrique aux shorts)
-// ============================================================
 // Version  : 10.0.0
 // Auteur   : Ibradaka
 // Date     : 2026-05-17
@@ -107,20 +27,20 @@
 
 //@version=6
 strategy(
-    title                   = "SMC Strategy v13 NASDAQ — Trailing ATR",
-    shorttitle              = "v13 NAS",
+    title                   = "SMC Strategy v10 — Institutional Full Stack",
+    shorttitle              = "SMC v10",
     overlay                 = true,
-    initial_capital         = 10000,
+    initial_capital         = 5000,
     default_qty_type        = strategy.fixed,
-    default_qty_value       = 1,
+    default_qty_value       = 1000,
     commission_type         = strategy.commission.cash_per_order,
     commission_value        = 0.70,
     slippage                = 2,
     process_orders_on_close = true,
     max_bars_back           = 500,
     pyramiding              = 0,
-    margin_long             = 5.0,
-    margin_short            = 5.0
+    margin_long             = 2.0,
+    margin_short            = 2.0
 )
 
 // ============================================================
@@ -139,22 +59,18 @@ var string GRP_FILTER  = "Filtres standard"
 var string GRP_MGMT    = "Gestion de position"
 var string GRP_DISP    = "Affichage"
 
-// --- Risque (NASDAQ : 1 "pip" = 1.0 point d'indice) ---
+// --- Risque ---
 risk_usd   = input.float(25.0, "Risque par trade (USD)", minval=5,  maxval=500, step=5,   group=GRP_RISK)
-min_rr     = input.float(1.5,  "RR minimum",             minval=1.0, maxval=6.0, step=0.1, group=GRP_RISK,
-     tooltip="NASDAQ : 1.5 — meme reglage que gold. A tester aussi a 2.0.")
-sl_min_pips= input.int(30,     "SL minimum (points)",    minval=10, maxval=200,            group=GRP_RISK,
-     tooltip="NASDAQ : 1 point = 1.0. 30 points min. SL plus serre = signal rejete.")
-sl_max_pips= input.int(300,    "SL maximum (points)",    minval=50, maxval=1000,           group=GRP_RISK,
-     tooltip="NASDAQ : 300 points max. SL plus large = signal rejete (risque trop grand).")
+min_rr     = input.float(2.0,  "RR minimum",             minval=1.0, maxval=6.0, step=0.1, group=GRP_RISK)
+sl_min_pips= input.int(8,      "SL minimum (pips)",      minval=3,  maxval=50,             group=GRP_RISK)
+sl_max_pips= input.int(35,     "SL maximum (pips)",      minval=10, maxval=150,            group=GRP_RISK)
 use_longs  = input.bool(false, "Activer les longs",      group=GRP_RISK,
-     tooltip="NASDAQ : desactive — backtest WR longs 37.5%, net -107$. Le 15M NASDAQ est trop choppy en intraday pour les longs SMC. Shorts only.")
+     tooltip="Desactive — WR longs 25.93% même avec H4 BOS bull (breakeven ~36% à RR 1.8)")
 use_shorts = input.bool(true,  "Activer les shorts",     group=GRP_RISK)
 
 // --- Liquidité ---
 eq_lookback   = input.int(20,   "Lookback EQH/EQL",      minval=5,  maxval=100,            group=GRP_LIQ)
-eq_pip_tol    = input.float(15.0,"Tolerance EQH/EQL (points)",minval=2.0,maxval=60.0,step=1.0,group=GRP_LIQ,
-     tooltip="NASDAQ : 15 points tolerance pour matcher 2 highs/lows comme EQH/EQL.")
+eq_pip_tol    = input.float(3.0,"Tolerance EQH/EQL (pips)",minval=0.5,maxval=10.0,step=0.5,group=GRP_LIQ)
 sweep_lookback= input.int(30,   "Lookback sweep",         minval=5,  maxval=80,             group=GRP_LIQ)
 show_eqh_eql  = input.bool(true,"Afficher EQH / EQL",                                      group=GRP_LIQ)
 show_sweeps   = input.bool(true,"Afficher sweeps",                                          group=GRP_LIQ)
@@ -168,8 +84,7 @@ show_bos       = input.bool(true,"Afficher BOS",                                
 show_choch     = input.bool(true,"Afficher CHoCH",                                         group=GRP_STRUCT)
 
 // --- FVG ---
-fvg_atr_mult  = input.float(0.9,"Impulsion FVG min (xATR)",minval=0.3,maxval=5.0,step=0.1,group=GRP_FVG,
-     tooltip="GOLD : 0.9 (au lieu de 1.2) — FVG sur gold plus petites en relatif a l'ATR.")
+fvg_atr_mult  = input.float(1.2,"Impulsion FVG min (xATR)",minval=0.3,maxval=5.0,step=0.1,group=GRP_FVG)
 fvg_max_slots = input.int(3,    "Slots FVG actifs",       minval=1,  maxval=5,             group=GRP_FVG)
 show_fvg      = input.bool(true,"Afficher FVG",                                            group=GRP_FVG)
 
@@ -184,28 +99,21 @@ use_h4_bos   = input.bool(true, "BOS H4 obligatoire",    group=GRP_HTF,
      tooltip="Exige un BOS H4 dans la direction du trade. Se reset sur BOS inverse.")
 use_h4_align = input.bool(false, "Alignement EMA50/200 H4 (trend strength)", group=GRP_HTF,
      tooltip="Short : EMA50 H4 < EMA200 H4. Long : EMA50 H4 > EMA200 H4.")
-use_h4_align_longs = input.bool(true, "H4 EMA50>EMA200 obligatoire (longs only)", group=GRP_HTF,
-     tooltip="V10.2 anti-contre-tendance — exige EMA50 H4 > EMA200 H4 UNIQUEMENT pour les longs. Shorts non concernes.")
 h4_bos_lb    = input.int(10,   "Lookback BOS H4 (bars H4)",minval=3,maxval=30,           group=GRP_HTF)
 show_h4_ema  = input.bool(true,"Afficher EMA50 H4",                                      group=GRP_HTF)
 
 // --- Sessions ---
 use_session  = input.bool(true, "Filtre session actif",                                   group=GRP_SESSION)
-sess_lo_open = input.bool(false,"EU pre-market 07:00-10:00 UTC",                         group=GRP_SESSION,
-     tooltip="NASDAQ : desactive par defaut — faible volume hors session US.")
-sess_ny_open = input.bool(true, "US open      14:30-17:00 UTC (cash open killzone)",     group=GRP_SESSION,
-     tooltip="NASDAQ : ouverture cash US 9:30-12:30 ET — la fenetre la plus volatile.")
-sess_lo_full = input.bool(false,"EU full      07:00-12:00 UTC",                          group=GRP_SESSION,
-     tooltip="NASDAQ : desactive par defaut — faible volume hors session US.")
-sess_ny_full = input.bool(true, "US full      14:30-21:00 UTC (session cash complete)",  group=GRP_SESSION,
-     tooltip="NASDAQ : session cash US complete 9:30-16:00 ET.")
+sess_lo_open = input.bool(true, "London open  07:00-10:00 UTC",                          group=GRP_SESSION)
+sess_ny_open = input.bool(true, "NY open      12:00-15:00 UTC",                          group=GRP_SESSION)
+sess_lo_full = input.bool(true, "London full  07:00-12:00 UTC",                          group=GRP_SESSION)
+sess_ny_full = input.bool(true, "NY full      12:00-17:00 UTC",                          group=GRP_SESSION)
 
 // --- Impulsion ---
 use_displacement = input.bool(true,  "Displacement candle (3 dernières bougies)", group=GRP_IMPULSE,
      tooltip="Au moins 1 des 3 dernières bougies doit etre une grande bougie d'impulsion directionnelle")
 disp_body_pct    = input.float(0.60, "Corps minimum (% range)", minval=0.40,maxval=0.85,step=0.05, group=GRP_IMPULSE)
-disp_atr_mult    = input.float(1.0,  "Range minimum (x ATR14)", minval=0.5, maxval=3.0, step=0.1,  group=GRP_IMPULSE,
-     tooltip="GOLD : 1.0 (au lieu de 1.3) — gold 15M range moyen plus serre en relatif.")
+disp_atr_mult    = input.float(1.3,  "Range minimum (x ATR14)", minval=0.8, maxval=3.0, step=0.1,  group=GRP_IMPULSE)
 use_volume_filter= input.bool(false, "Volume spike (tick vol — optionnel)", group=GRP_IMPULSE,
      tooltip="Tick volume FOREX = proxy du volume reel. Desactive par defaut.")
 vol_spike_mult   = input.float(1.2,  "Volume spike (x moyenne 20)", minval=1.0,maxval=3.0,step=0.1,group=GRP_IMPULSE)
@@ -217,21 +125,11 @@ use_atr_filter= input.bool(true, "Filtre ATR volatilite",                       
 atr_pct       = input.float(0.75,"ATR seuil (x moy 50)",   minval=0.3,maxval=1.5,step=0.05,group=GRP_FILTER)
 use_candle_cf = input.bool(false,"Confirmation bougie entree (corps>50%)",              group=GRP_FILTER)
 use_discount  = input.bool(false,"Filtre discount/premium",                             group=GRP_FILTER)
-use_strict_longs = input.bool(false,"3/3 confirmations obligatoires (longs only)", group=GRP_FILTER,
-     tooltip="GOLD : desactive par defaut — 3/3 trop rare sur gold 15M. Activer si tu veux des setups premium ultra-selectifs.")
-use_dxy_filter   = input.bool(false,"DXY < EMA50 H4 obligatoire (longs only)",     group=GRP_FILTER,
-     tooltip="GOLD v3.2 : REDESACTIVE apres test v3.1 — le filtre coupait 10 trades dont 5 gagnants, WR longs 43%->38%, net -236$. Correlation gold/DXY pas assez tight sur H4 pour un filtre binaire.")
 
 // --- Gestion de position ---
 use_breakeven  = input.bool(true, "Break-even a +1R",                                   group=GRP_MGMT)
 use_partial_tp = input.bool(true, "TP partiel 50% a +1.5R",                             group=GRP_MGMT)
 use_struct_exit= input.bool(true, "Exit sur rupture structure (10 bougies)",            group=GRP_MGMT)
-use_trail_atr  = input.bool(true, "Trailing ATR apres BE (v13)",                        group=GRP_MGMT,
-     tooltip="V13 GOLD : apres BE+1R atteint, le stop suit close +/- trail_atr_mult x ATR14. Capture les gros mouvements gold.")
-trail_atr_mult = input.float(1.5, "Trail ATR multiplier",  minval=0.5, maxval=4.0, step=0.1, group=GRP_MGMT,
-     tooltip="1.5 x ATR14 par defaut. Augmenter (2.0+) = trail plus large = moins de sorties prematurees. Reduire (1.0) = trail plus serre = capture moins de fluctuations.")
-use_eod_flat   = input.bool(true, "Flat week-end vendredi (anti-gap)",                   group=GRP_MGMT,
-     tooltip="NASDAQ anti-gap : le VENDREDI uniquement, coupe toute position vers 20:45 UTC et bloque les entrees apres 20:00 UTC. Evite de tenir une position pendant le gap de week-end (vendredi soir -> lundi) ou le SL peut etre traverse — perte >> risque vise. Pas de flat en semaine : USTECs cote 24h, inutile de tronquer les trailing ATR gagnants.")
 
 // --- Affichage ---
 show_dashboard     = input.bool(true,  "Dashboard statistiques",                         group=GRP_DISP)
@@ -241,8 +139,7 @@ show_discount_zone = input.bool(false, "Zones premium/discount",                
 // SECTION 2 — UTILITAIRES DE BASE
 // ============================================================
 
-// NASDAQ : pip hardcode a 1.0 (1 point d'indice, broker-independant)
-pip       = 1.0
+pip       = syminfo.mintick * 10
 atr14     = ta.atr(14)
 atr50_avg = ta.sma(atr14, 50)
 
@@ -311,25 +208,19 @@ ema_bear       = not use_ema_filter or (close < h4_ema200)
 h4_bos_ok_bear = not use_h4_bos   or h4_trend_bear
 h4_bos_ok_bull = not use_h4_bos   or h4_trend_bull
 h4_align_bear  = not use_h4_align or (h4_ema50 < h4_ema200)
-// v10.2 : h4_align_bull active si use_h4_align OU use_h4_align_longs
-h4_align_bull  = (not use_h4_align and not use_h4_align_longs) or (h4_ema50 > h4_ema200)
-
-// v10.2 — DXY filter (longs only)
-dxy_close_h4 = request.security("TVC:DXY", "240", close,                     lookahead=barmerge.lookahead_off)
-dxy_ema50_h4 = request.security("TVC:DXY", "240", ta.ema(close, 50),         lookahead=barmerge.lookahead_off)
-dxy_ok_long  = not use_dxy_filter or (dxy_close_h4 < dxy_ema50_h4)
+h4_align_bull  = not use_h4_align or (h4_ema50 > h4_ema200)
 
 // ============================================================
 // SECTION 4 — SESSIONS
 // ============================================================
 
-// NASDAQ : sessions retimees sur la session cash US
-in_lo_open = not na(time(timeframe.period, "0700-1000", "UTC"))   // EU pre-market
-in_ny_open = not na(time(timeframe.period, "1430-1700", "UTC"))   // US cash open killzone
+// Opens (haute volatilité) — défaut v10
+in_lo_open = not na(time(timeframe.period, "0700-1000", "UTC"))
+in_ny_open = not na(time(timeframe.period, "1200-1500", "UTC"))
 
-// Sessions complètes
-in_lo_full = not na(time(timeframe.period, "0700-1200", "UTC"))   // EU full
-in_ny_full = not na(time(timeframe.period, "1430-2100", "UTC"))   // US cash session complete
+// Sessions complètes (option élargie)
+in_lo_full = not na(time(timeframe.period, "0700-1200", "UTC"))
+in_ny_full = not na(time(timeframe.period, "1200-1700", "UTC"))
 
 in_london  = (sess_lo_open and in_lo_open) or (sess_lo_full and in_lo_full)
 in_ny      = (sess_ny_open and in_ny_open) or (sess_ny_full and in_ny_full)
@@ -338,17 +229,6 @@ in_session = not use_session or in_london or in_ny
 // Session London brute (pour reset ASR — indépendant des paramètres utilisateur)
 in_lo_raw         = not na(time(timeframe.period, "0700-1200", "UTC"))
 is_london_open_bar = in_lo_raw and not in_lo_raw[1]
-
-// NASDAQ anti-gap — flat du VENDREDI uniquement.
-// USTECs (CFD) cote ~24h/24 : la fin de session cash US ne cree PAS de gap,
-// seul le week-end (vendredi soir -> lundi) est un vrai gap structurel.
-// On ne coupe donc PAS en semaine (sinon on tronque les trailing ATR gagnants),
-// uniquement le vendredi en fin de session.
-//   in_late_session : vendredi 20:00-21:00 UTC -> plus de nouvelle entree
-//   in_eod_window   : vendredi 20:45-21:00 UTC -> on coupe toute position ouverte
-is_friday       = dayofweek == dayofweek.friday
-in_late_session = is_friday and not na(time(timeframe.period, "2000-2100", "UTC"))
-in_eod_window   = is_friday and not na(time(timeframe.period, "2045-2100", "UTC"))
 
 // ============================================================
 // SECTION 5 — NIVEAUX INSTITUTIONNELS (PDH/PDL, ASR)
@@ -594,7 +474,7 @@ if array.size(fvg_bear_live) > 0
         if array.get(fvg_bear_live, k)
             if low <= array.get(fvg_bear_top, k) and high >= array.get(fvg_bear_bot, k)
                 price_in_bear_fvg := true
-                break
+            break
 
 if show_fvg and barstate.isconfirmed
     if fvg_bull_raw
@@ -691,7 +571,7 @@ if array.size(ob_bear_live) > 0
         if array.get(ob_bear_live, k)
             if low <= array.get(ob_bear_top, k) and high >= array.get(ob_bear_bot, k)
                 price_in_bear_ob := true
-                break
+            break
 
 // ============================================================
 // SECTION 11 — ZONES PREMIUM / DISCOUNT
@@ -726,28 +606,23 @@ if show_discount_zone and barstate.islast
 struct_bull = bos_bull_ok or choch_bull_ok
 struct_bear = bos_bear_ok or choch_bear_ok
 
-near_pdl   = not na(pdl)      and math.abs(low  - pdl)      < eq_pip_tol * pip * 3
-near_pdh   = not na(pdh)      and math.abs(high - pdh)      < eq_pip_tol * pip * 3
-near_asr_l = not na(asr_low)  and math.abs(low  - asr_low)  < eq_pip_tol * pip * 3
-near_asr_h = not na(asr_high) and math.abs(high - asr_high) < eq_pip_tol * pip * 3
+near_pdl = not na(pdl) and math.abs(low  - pdl) < eq_pip_tol * pip * 3
+near_pdh = not na(pdh) and math.abs(high - pdh) < eq_pip_tol * pip * 3
 
-// Liquidite = sweep OU egalite (EQ) OU niveau journalier (PDH/PDL) OU range asiatique (ASR)
-liq_bull = sweep_l_ok or eql_found or near_pdl or near_asr_l
-liq_bear = sweep_h_ok or eqh_found or near_pdh or near_asr_h
+liq_bull = sweep_l_ok or eql_found or near_pdl
+liq_bear = sweep_h_ok or eqh_found or near_pdh
 
-// 2 confirmations sur 3 (FVG, OB, Liquidite) — symetrique longs/shorts
-bull_ab = price_in_bull_fvg and liq_bull              // FVG + Liquidite
-bull_ac = price_in_bull_ob  and liq_bull              // OB  + Liquidite
-bull_bc = price_in_bull_ob  and price_in_bull_fvg     // OB  + FVG
+// LONG : sweep obligatoire pour les combinaisons avec liquidité
+bull_ab = price_in_bull_fvg and sweep_l_ok
+bull_ac = price_in_bull_ob  and sweep_l_ok
+bull_bc = price_in_bull_ob  and price_in_bull_fvg
 
-// v10.2 — Mode strict longs : exige 3/3 confirmations (FVG + OB + Liquidite)
-long_confirmed_2of3 = struct_bull and (bull_ab or bull_ac or bull_bc)
-long_confirmed_3of3 = struct_bull and price_in_bull_fvg and price_in_bull_ob and liq_bull
-long_confirmed = use_strict_longs ? long_confirmed_3of3 : long_confirmed_2of3
+long_confirmed = struct_bull and (bull_ab or bull_ac or bull_bc)
 
-bear_ab = price_in_bear_fvg and liq_bear              // FVG + Liquidite
-bear_ac = price_in_bear_ob  and liq_bear              // OB  + Liquidite
-bear_bc = price_in_bear_ob  and price_in_bear_fvg     // OB  + FVG
+// SHORT : liquidité élargie (sweep OU EQH OU near PDH)
+bear_ab = price_in_bear_fvg and liq_bear
+bear_ac = price_in_bear_ob  and liq_bear
+bear_bc = price_in_bear_ob  and price_in_bear_fvg
 
 short_confirmed = struct_bear and (bear_ab or bear_ac or bear_bc)
 
@@ -810,13 +685,11 @@ tp_short_raw = _tp_short(close, sl_short_raw)
 rr_long_real  = sl_long_pips  > 0 ? (tp_long_raw  - close)         / (close        - sl_long_raw)  : 0.0
 rr_short_real = sl_short_pips > 0 ? (close         - tp_short_raw)  / (sl_short_raw - close)        : 0.0
 
-// Sizing dynamique fractionnaire (qty = risk_usd / sl_distance_prix)
-// NASDAQ : SL ~30-300 points -> qty fractionnaire (0.1-0.8 contrat). PAS de math.round
-// sinon qty=0.25 deviendrait 0 -> position forcee a 1 -> risque 4x trop grand.
+// Sizing dynamique en unités (qty = risk_usd / sl_distance_prix)
 sl_dist_long  = math.max(close - sl_long_raw,  sl_min_pips * pip)
 sl_dist_short = math.max(sl_short_raw - close, sl_min_pips * pip)
-qty_long  = math.max(0.1, math.min(20.0, risk_usd / sl_dist_long))
-qty_short = math.max(0.1, math.min(20.0, risk_usd / sl_dist_short))
+qty_long  = math.max(1000.0, math.min(500000.0, math.round(risk_usd / sl_dist_long)))
+qty_short = math.max(1000.0, math.min(500000.0, math.round(risk_usd / sl_dist_short)))
 
 // ============================================================
 // SECTION 14 — CONDITIONS D'ENTRÉE FINALES
@@ -831,14 +704,11 @@ enter_long = use_longs
      and no_position
      and barstate.isconfirmed
      and in_session
-     and not (use_eod_flat and in_late_session)   // anti-gap : pas d'entree en fin de session
      and atr_ok
-     and long_confirmed              // v10.2 : 3/3 si use_strict_longs sinon 2/3
-     and not short_confirmed         // filtre clarte directionnelle (symetrique aux shorts)
+     and long_confirmed
      and ema_bull
      and h4_bos_ok_bull
-     and h4_align_bull               // v10.2 : EMA50 H4 > EMA200 H4 si use_h4_align_longs
-     and dxy_ok_long                 // v10.2 : DXY < EMA50 H4 (USD faible)
+     and h4_align_bull
      and disp_ok_long
      and vol_ok
      and candle_ok_long
@@ -851,7 +721,6 @@ enter_short = use_shorts
      and no_position
      and barstate.isconfirmed
      and in_session
-     and not (use_eod_flat and in_late_session)   // anti-gap : pas d'entree en fin de session
      and atr_ok
      and short_confirmed
      and not long_confirmed      // filtre clarté directionnelle
@@ -875,11 +744,6 @@ var float entry_tp  = na
 var float entry_tp1 = na
 var bool  be_done   = false
 var bool  tp1_done  = false
-
-// v13 GOLD — tracking trailing ATR (highest/lowest stop atteint)
-var float trail_high_sl_long  = na
-var float trail_low_sl_short  = na
-var bool  trail_started       = false
 
 if enter_long
     entry_sl  := sl_long_raw
@@ -924,13 +788,10 @@ is_short_pos = strategy.position_size < 0
 avg_px       = strategy.position_avg_price
 
 // --- Flags pour les alertes webhook de gestion (live) ---
-// Le bot/executor repliquent en live ce que le backtest fait : BE, trailing,
-// TP partiel, sortie structure. Mis a true sur la bougie ou l'action declenche.
+// v10 : pas de trailing ATR -> seulement break-even, TP partiel, sortie structure.
 mgmt_be_now     = false
 mgmt_tp1_now    = false
-mgmt_trail_now  = false
 mgmt_struct_now = false
-mgmt_trail_pips = 0.0
 mgmt_dir        = is_long_pos ? "bull" : "bear"
 
 if (is_long_pos or is_short_pos) and not na(entry_sl) and not na(entry_tp)
@@ -969,9 +830,7 @@ if (is_long_pos or is_short_pos) and not na(entry_sl) and not na(entry_tp)
                  limit       = entry_tp1,
                  comment     = "TP1 Short 50%")
 
-    // v13 GOLD — struct exit actif AVANT le BE, ou si trailing desactive
-    // Apres BE+trailing : le trailing ATR est le seul mecanisme de sortie
-    if use_struct_exit and not (be_done and use_trail_atr)
+    if use_struct_exit
         struct_l = ta.lowest(low,   10)[1]
         struct_h = ta.highest(high, 10)[1]
         if is_long_pos  and close < struct_l
@@ -981,53 +840,9 @@ if (is_long_pos or is_short_pos) and not na(entry_sl) and not na(entry_tp)
             mgmt_struct_now := true
             strategy.close("Short", comment="Struct exit S")
 
-    // v13 GOLD — Trailing ATR (apres BE+1R atteint)
-    // FIX : on ANNULE l'exit fixe (Long_exit/Short_exit) et on place un exit
-    //       trailing pur (Long_trail/Short_trail) sans TP plafond.
-    // FIX : trail_high/low en var pour garantir que le stop ne recule jamais.
-    if use_trail_atr and be_done
-        if is_long_pos
-            new_trail_long = close - trail_atr_mult * atr14
-            if na(trail_high_sl_long) or new_trail_long > trail_high_sl_long
-                trail_high_sl_long := new_trail_long
-            if trail_high_sl_long > avg_px + pip   // jamais sous le BE+1pip
-                if not trail_started
-                    strategy.cancel("Long_exit")   // retire l'exit fixe SL+TP
-                    trail_started := true
-                strategy.exit("Long_trail", from_entry="Long",
-                     stop    = trail_high_sl_long,
-                     comment = "Trail ATR L")
-                mgmt_trail_now  := true
-                mgmt_trail_pips := (close - trail_high_sl_long) / pip
-        if is_short_pos
-            new_trail_short = close + trail_atr_mult * atr14
-            if na(trail_low_sl_short) or new_trail_short < trail_low_sl_short
-                trail_low_sl_short := new_trail_short
-            if trail_low_sl_short < avg_px - pip   // jamais au-dessus du BE-1pip
-                if not trail_started
-                    strategy.cancel("Short_exit")  // retire l'exit fixe SL+TP
-                    trail_started := true
-                strategy.exit("Short_trail", from_entry="Short",
-                     stop    = trail_low_sl_short,
-                     comment = "Trail ATR S")
-                mgmt_trail_now  := true
-                mgmt_trail_pips := (trail_low_sl_short - close) / pip
-
-// --- NASDAQ anti-gap — flat du vendredi soir (avant le gap de week-end) -----
-// Le vendredi, si une position est encore ouverte dans la fenetre 20:45-21:00
-// UTC, on la coupe. Tenir une position pendant le week-end peut faire traverser
-// le SL au gap d'ouverture du lundi et generer une perte >> risque vise.
-eod_flat_now = use_eod_flat and in_eod_window and strategy.position_size != 0
-eod_flat_dir = strategy.position_size > 0 ? "bull" : "bear"
-if eod_flat_now
-    strategy.close_all(comment="EOD flat (anti-gap)")
-
 if no_position
     entry_sl := na
     entry_tp := na
-    trail_high_sl_long := na
-    trail_low_sl_short := na
-    trail_started      := false
 
 // ============================================================
 // SECTION 17 — DASHBOARD STATISTIQUES
@@ -1043,61 +858,19 @@ if show_dashboard
     dd     = strategy.max_drawdown
 
     htf_state = h4_trend_bear ? "BEAR ✓" : h4_trend_bull ? "BULL" : "—"
-    h4_align  = h4_ema50 < h4_ema200 ? "EMA50<200 (bear)" : "EMA50>200 (bull)"
-    dxy_state = dxy_close_h4 < dxy_ema50_h4 ? "DXY bear (long OK)" : "DXY bull (long bloque)"
+    h4_align  = h4_ema50 < h4_ema200 ? "EMA50<200 ✓" : "EMA50>200"
 
-    // v3 — Diagnostic : compte combien de bougies passent chaque filtre (cumul depuis debut)
-    var int diag_session = 0
-    var int diag_atr = 0
-    var int diag_long_conf = 0
-    var int diag_short_conf = 0
-    var int diag_ema_bull = 0
-    var int diag_ema_bear = 0
-    var int diag_h4_bos_bull = 0
-    var int diag_h4_bos_bear = 0
-    var int diag_sl_long_valid = 0
-    var int diag_sl_short_valid = 0
-    var int diag_rr_long_ok = 0
-    var int diag_rr_short_ok = 0
-
-    if barstate.isconfirmed
-        diag_session       += in_session       ? 1 : 0
-        diag_atr           += atr_ok           ? 1 : 0
-        diag_long_conf     += long_confirmed   ? 1 : 0
-        diag_short_conf    += short_confirmed  ? 1 : 0
-        diag_ema_bull      += ema_bull         ? 1 : 0
-        diag_ema_bear      += ema_bear         ? 1 : 0
-        diag_h4_bos_bull   += h4_bos_ok_bull   ? 1 : 0
-        diag_h4_bos_bear   += h4_bos_ok_bear   ? 1 : 0
-        diag_sl_long_valid += sl_long_valid    ? 1 : 0
-        diag_sl_short_valid+= sl_short_valid   ? 1 : 0
-        diag_rr_long_ok    += (rr_long_real  >= min_rr) ? 1 : 0
-        diag_rr_short_ok   += (rr_short_real >= min_rr) ? 1 : 0
-
-    txt = "SMC v13 NASDAQ\n" +
+    txt = "SMC v10\n" +
           "────────────\n" +
           "Trades : " + str.tostring(total)                        + "\n" +
+          "Wins   : " + str.tostring(wins)                         + "\n" +
           "WR     : " + str.tostring(math.round(wr,   1)) + "%"   + "\n" +
+          "PF     : " + str.tostring(math.round(pf,   2))         + "\n" +
           "Net    : " + str.tostring(math.round(net,  2)) + " $"  + "\n" +
           "MaxDD  : " + str.tostring(math.round(dd,   2)) + " $"  + "\n" +
           "────────────\n" +
           "H4 BOS : " + htf_state + "\n" +
-          "H4 EMA : " + h4_align + "\n" +
-          "DXY    : " + dxy_state + "\n" +
-          "────────────\n" +
-          "DIAGNOSTIC (cumul bougies)\n" +
-          "Session     : " + str.tostring(diag_session) + "\n" +
-          "ATR ok      : " + str.tostring(diag_atr) + "\n" +
-          "Long conf   : " + str.tostring(diag_long_conf) + "\n" +
-          "Short conf  : " + str.tostring(diag_short_conf) + "\n" +
-          "EMA bull    : " + str.tostring(diag_ema_bull) + "\n" +
-          "EMA bear    : " + str.tostring(diag_ema_bear) + "\n" +
-          "H4 BOS bull : " + str.tostring(diag_h4_bos_bull) + "\n" +
-          "H4 BOS bear : " + str.tostring(diag_h4_bos_bear) + "\n" +
-          "SL Long ok  : " + str.tostring(diag_sl_long_valid) + "\n" +
-          "SL Short ok : " + str.tostring(diag_sl_short_valid) + "\n" +
-          "RR Long ok  : " + str.tostring(diag_rr_long_ok) + "\n" +
-          "RR Short ok : " + str.tostring(diag_rr_short_ok)
+          "H4 EMA : " + h4_align
 
     var table dash = table.new(position.top_right, 1, 1,
          bgcolor      = color.new(color.black, 10),
@@ -1123,7 +896,7 @@ plot(show_discount_zone ? range_mid : na, "Midpoint",
 var string GRP_WH = "Webhook (deploiement bot)"
 wh_secret = input.string("",       "Cle secrete webhook", group=GRP_WH,
      tooltip="Colle ici la cle WEBHOOK_SECRET_KEY du VPS. Sans elle le bot rejette le signal (AUTH_ECHEC).")
-wh_symbol = input.string("USTECs", "Symbole (bot)",       group=GRP_WH,
+wh_symbol = input.string("EURUSDs", "Symbole (bot)",      group=GRP_WH,
      tooltip="Nom exact du symbole chez Switch Markets : XAUUSDs (gold), EURUSDs, USTECs (nasdaq).")
 wh_tf     = input.string("15",     "Timeframe (bot)",     options=["4H","15","5"], group=GRP_WH)
 
@@ -1144,30 +917,17 @@ wh_msg_short = '{"secret":"' + wh_secret + '","event_type":"BOS_BEAR","symbol":"
      ',"tp_pips":' + str.tostring(math.round(wh_tp_short_pips, 1)) +
      ',"prefiltered":true,"timestamp":"' + wh_ts + '"}'
 
-// Signal de cloture EOD au bot (anti-gap NASDAQ) — le bot ferme la position live
-wh_msg_close = '{"secret":"' + wh_secret + '","event_type":"CLOSE","symbol":"' + wh_symbol +
-     '","timeframe":"' + wh_tf + '","price":' + str.tostring(close) +
-     ',"direction":"' + eod_flat_dir + '","prefiltered":true,"timestamp":"' + wh_ts + '"}'
-
 // Envoi du signal au bot (a la cloture de la bougie d'entree)
 if enter_long
     alert(wh_msg_long,  alert.freq_once_per_bar_close)
 if enter_short
     alert(wh_msg_short, alert.freq_once_per_bar_close)
-if eod_flat_now
-    alert(wh_msg_close, alert.freq_once_per_bar_close)
 
 // --- Alertes de gestion en cours de trade (live = backtest) ---
-// Le bot relaie ces ordres a l'executor : SL au break-even, SL suiveur,
-// cloture partielle, sortie sur rupture de structure.
+// v10 : break-even, TP partiel, sortie structure (pas de trailing ATR).
 wh_msg_be = '{"secret":"' + wh_secret + '","event_type":"BREAK_EVEN","symbol":"' + wh_symbol +
      '","timeframe":"' + wh_tf + '","price":' + str.tostring(close) +
      ',"direction":"' + mgmt_dir + '","timestamp":"' + wh_ts + '"}'
-
-wh_msg_trail = '{"secret":"' + wh_secret + '","event_type":"TRAIL_SL","symbol":"' + wh_symbol +
-     '","timeframe":"' + wh_tf + '","price":' + str.tostring(close) +
-     ',"direction":"' + mgmt_dir + '","trail_pips":' + str.tostring(math.round(mgmt_trail_pips, 1)) +
-     ',"timestamp":"' + wh_ts + '"}'
 
 wh_msg_tp1 = '{"secret":"' + wh_secret + '","event_type":"PARTIAL_CLOSE","symbol":"' + wh_symbol +
      '","timeframe":"' + wh_tf + '","price":' + str.tostring(close) +
@@ -1179,13 +939,11 @@ wh_msg_struct = '{"secret":"' + wh_secret + '","event_type":"CLOSE","symbol":"' 
 
 if mgmt_be_now
     alert(wh_msg_be,     alert.freq_once_per_bar_close)
-if mgmt_trail_now
-    alert(wh_msg_trail,  alert.freq_once_per_bar_close)
 if mgmt_tp1_now
     alert(wh_msg_tp1,    alert.freq_once_per_bar_close)
 if mgmt_struct_now
     alert(wh_msg_struct, alert.freq_once_per_bar_close)
 
 // Alertes texte simples (debug / supervision)
-alertcondition(enter_long,  title="SMC v13 NASDAQ LONG",  message="SMC v13 NASDAQ LONG {{ticker}}")
-alertcondition(enter_short, title="SMC v13 NASDAQ SHORT", message="SMC v13 NASDAQ SHORT {{ticker}}")
+alertcondition(enter_long,  title="SMC v10 EURUSD LONG",  message="SMC v10 EURUSD LONG {{ticker}}")
+alertcondition(enter_short, title="SMC v10 EURUSD SHORT", message="SMC v10 EURUSD SHORT {{ticker}}")
