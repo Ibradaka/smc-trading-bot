@@ -92,3 +92,45 @@ async def send_order(signal: dict) -> tuple[bool, str, float, str]:
     err = data.get("error", f"HTTP {resp.status_code}")
     logger.error("Executor MT5 a refuse l'ordre : %s", err)
     return False, "", lot_size, err
+
+
+async def send_close(signal: dict) -> tuple[bool, str, str]:
+    """
+    Demande a l'executor MT5 de fermer toute position du bot (magic 13013)
+    sur ce symbole. Utilise pour le flat de fin de session (anti-gap NASDAQ).
+
+    Fermer une position deja close (TP/SL deja touche) renvoie success avec
+    closed=0 — c'est normal, l'objectif "etre flat" est atteint.
+
+    Returns:
+        (success, description, error_message)
+    """
+    symbol = signal["symbol"]
+
+    if not MT5_EXECUTOR_URL:
+        return False, "", "MT5_EXECUTOR_URL non configure dans le .env"
+
+    close_url = MT5_EXECUTOR_URL.replace("/order", "/close")
+    payload = {"secret": MT5_EXECUTOR_SECRET, "symbol": symbol}
+
+    logger.info("Demande de cloture a l'executor MT5 : %s", symbol)
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.post(close_url, json=payload)
+        data = resp.json()
+    except httpx.TimeoutException:
+        return False, "", f"Timeout ({_TIMEOUT}s) — executor MT5 ne repond pas"
+    except Exception as exc:
+        logger.error("Erreur appel /close executor MT5 : %s", exc, exc_info=True)
+        return False, "", str(exc)
+
+    if resp.status_code == 200 and data.get("success"):
+        closed = data.get("closed", 0)
+        desc = f"MT5 close {symbol} — {closed} position(s) fermee(s)"
+        logger.info("Executor MT5 OK — %s", desc)
+        return True, desc, ""
+
+    err = data.get("error", f"HTTP {resp.status_code}")
+    logger.error("Executor MT5 a refuse la cloture : %s", err)
+    return False, "", err

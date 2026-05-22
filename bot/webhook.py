@@ -19,6 +19,7 @@ SESSION_OPEN est toujours ALLOW (événement de gestion interne, non tradeable).
 
 import logging
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -42,11 +43,50 @@ FORCED_DIRECTIONS: dict[str, str | None] = {
     "BOS_BEAR":       "bear",
     "SESSION_OPEN":   None,   # libre
     "RANGE_BREAKOUT": None,   # libre
+    "CLOSE":          None,   # libre — clôture forcée
 }
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------------------
+# Déduplication anti-doublons
+# ---------------------------------------------------------------------------
+# TradingView peut livrer le même webhook plusieurs fois (retry sur lag,
+# double envoi documenté). Sans garde-fou, le bot placerait 2 ordres.
+# On garde l'empreinte des signaux traités pendant _DEDUP_TTL secondes.
+# Clé = symbol|event_type|direction|timestamp — le timestamp étant l'heure
+# de la bougie (généré par le Pine), deux trades distincts ne peuvent pas
+# partager la même clé.
+
+_DEDUP_TTL = 3600.0  # 1 h — bien au-delà de tout retry TradingView
+_processed_signals: dict[str, float] = {}
+
+
+def _dedup_key(payload: dict) -> str:
+    return "|".join((
+        str(payload.get("symbol", "")),
+        str(payload.get("event_type", "")),
+        str(payload.get("direction", "")),
+        str(payload.get("timestamp", "")),
+    ))
+
+
+def _is_duplicate(payload: dict) -> bool:
+    """True si ce signal a déjà été traité récemment ; l'enregistre sinon."""
+    now = time.monotonic()
+    # Éviction des empreintes expirées (garde le cache borné)
+    for expired in [k for k, ts in _processed_signals.items()
+                    if now - ts > _DEDUP_TTL]:
+        del _processed_signals[expired]
+
+    key = _dedup_key(payload)
+    if key in _processed_signals:
+        return True
+    _processed_signals[key] = now
+    return False
 
 
 def _block(signal_id: str, signal: dict, reason: str, detail: str,
@@ -265,6 +305,21 @@ async def process(payload: dict) -> dict:
         return _block(signal_id, payload, "PAYLOAD_INVALIDE", detail, filters_passed)
     filters_passed.append("VALIDATION")
 
+    # --- Anti-doublon : ignore un webhook déjà traité (retry TradingView) ---
+    if _is_duplicate(payload):
+        logger.warning(
+            "DOUBLON ignoré | id=%s | %s | %s | ts=%s",
+            signal_id,
+            payload.get("event_type", "?"),
+            payload.get("symbol", "?"),
+            payload.get("timestamp", "?"),
+        )
+        return _block(
+            signal_id, payload, "DOUBLON",
+            "Signal déjà traité — webhook dupliqué par TradingView, ignoré",
+            filters_passed,
+        )
+
     signal = payload  # payload validé, on le traite comme le signal
 
     # --- Filtre 3 : SYMBOLE ---
@@ -295,6 +350,33 @@ async def process(payload: dict) -> dict:
             "event_type": "SESSION_OPEN",
             "symbol": signal.get("symbol"),
             "detail": "Événement de gestion interne — aucun ordre envoyé",
+            "filters_passed": filters_passed,
+            "timestamp": _now_iso(),
+        }
+
+    # --- CLOSE : clôture forcée d'une position (flat anti-gap fin de session) ---
+    # Le Pine envoie cet événement quand il coupe une position en fin de
+    # session NASDAQ. Aucun filtre de trade : on ferme, point. Le filtre RISK
+    # est sauté (clôturer réduit le risque, ne doit jamais être bloqué).
+    if signal["event_type"] == "CLOSE":
+        logger.info(
+            "CLOSE reçu | id=%s | %s — clôture forcée demandée",
+            signal_id, signal["symbol"],
+        )
+        success, detail, err = await mt5_forwarder.send_close(signal)
+        if not success:
+            await telegram.notify_error(
+                context=f"Clôture MT5 — {signal['symbol']}",
+                error=err,
+            )
+            return _block(signal_id, signal, "CLOTURE_ECHEC", err, filters_passed)
+        logger.info("CLOSE OK | id=%s | %s | %s", signal_id, signal["symbol"], detail)
+        return {
+            "status": "ALLOW",
+            "signal_id": signal_id,
+            "event_type": "CLOSE",
+            "symbol": signal["symbol"],
+            "detail": detail,
             "filters_passed": filters_passed,
             "timestamp": _now_iso(),
         }

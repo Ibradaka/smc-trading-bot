@@ -84,6 +84,7 @@ VALID_EVENT_TYPES = {
     "SESSION_OPEN",
     "EMA_FILTER",
     "RANGE_BREAKOUT",
+    "CLOSE",            # cloture forcee d'une position (ex. flat fin de session NASDAQ)
 }
 
 TRADEABLE_EVENTS = {
@@ -110,6 +111,8 @@ BLOCK_REASONS = {
     "RR_INSUFFISANT":           "Ratio risque/rendement inférieur à 1:2",
     "CONFLUENCES_INSUFFISANTES": "Signal non confirmé par le timeframe supérieur",
     "ERREUR_TECHNIQUE":         "Erreur technique — trade bloqué par sécurité",
+    "DOUBLON":                  "Webhook dupliqué par TradingView — signal déjà traité",
+    "CLOTURE_ECHEC":            "L'executor MT5 n'a pas pu fermer la position",
 }
 
 # ---------------------------------------------------------------------------

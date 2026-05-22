@@ -59,7 +59,7 @@ RESET  = "\033[0m"
 BASE_VALID_PAYLOAD = {
     "secret":       "test-secret-key-smc",
     "event_type":   "SWEEP_HIGH",
-    "symbol":       "EURUSD",
+    "symbol":       "EURUSDs",
     "timeframe":    "15",
     "price":        1.08500,       # prix SOUS l'EMA (1.09000) => bear OK
     "direction":    "bear",        # SWEEP_HIGH => forcément bear
@@ -74,7 +74,7 @@ BASE_VALID_PAYLOAD = {
 BASE_VALID_BOS = {
     "secret":       "test-secret-key-smc",
     "event_type":   "BOS_BULL",
-    "symbol":       "EURUSD",
+    "symbol":       "EURUSDs",
     "timeframe":    "15",
     "price":        1.09500,       # prix AU-DESSUS de l'EMA (1.09000) => bull OK
     "direction":    "bull",        # BOS_BULL => forcément bull
@@ -91,11 +91,14 @@ BASE_VALID_BOS = {
 # ---------------------------------------------------------------------------
 
 def _reset_risk_state():
-    """Remet a zero le singleton RiskState entre les tests."""
+    """Remet a zero le singleton RiskState + le cache anti-doublon entre les tests."""
     risk_state._open_trades        = 0
     risk_state._daily_loss         = 0.0
     risk_state._weekly_loss        = 0.0
     risk_state._weekly_pause_until = None
+    # Vide le cache anti-doublon : sinon la reutilisation des payloads de test
+    # (memes symbol/event/direction/timestamp) declencherait le filtre DOUBLON.
+    webhook._processed_signals.clear()
 
 
 def _make_london_time():
@@ -160,9 +163,10 @@ async def _run_pipeline(
         patch("bot.notifications.telegram._safe_send", new=AsyncMock(return_value=None)),
     ]
     if mock_pineconnector:
+        # Le bot route desormais via mt5_forwarder (PineConnector abandonne).
         patches.append(patch(
-            "bot.execution.pineconnector.send_order",
-            new=AsyncMock(return_value=(True, "TEST-LIC,buy,EURUSD,contracts=0.15,sl=20,tp=50", 0.15, "")),
+            "bot.execution.mt5_forwarder.send_order",
+            new=AsyncMock(return_value=(True, "MT5 buy EURUSD lot=0.15 ticket=123", 0.15, "")),
         ))
     if mock_time is not None:
         patches.append(patch(
@@ -309,7 +313,7 @@ async def run_all_tests() -> TestResult:
     payload = {
         "secret":       "test-secret-key-smc",
         "event_type":   "SESSION_OPEN",
-        "symbol":       "EURUSD",
+        "symbol":       "EURUSDs",
         "timeframe":    "15",
         "price":        1.09400,
         "direction":    "bull",
@@ -325,6 +329,46 @@ async def run_all_tests() -> TestResult:
     )
     info = f"status={result['status']} detail={result.get('detail', '-')}" if not ok else ""
     results.record("SESSION_OPEN -> ALLOW sans trade (evenement de gestion)", ok, info)
+
+    # -----------------------------------------------------------------------
+    # ANTI-DOUBLON & CLOTURE
+    # -----------------------------------------------------------------------
+    print()
+    print(f"{BOLD}-- ANTI-DOUBLON & CLOTURE ---------------------------------{RESET}")
+
+    # Test 14 : meme webhook envoye 2x -> 2e = BLOCK DOUBLON
+    _reset_risk_state()
+    payload = dict(BASE_VALID_BOS)
+    first   = await _run_pipeline(payload, mock_time=_make_london_time())
+    second  = await _run_pipeline(payload, mock_time=_make_london_time())
+    ok = (
+        first["status"] == "ALLOW"
+        and second["status"] == "BLOCK"
+        and second.get("reason") == "DOUBLON"
+    )
+    info = (f"1er={first['status']} 2e={second['status']}/{second.get('reason', '-')}"
+            if not ok else "")
+    results.record("Webhook duplique -> 1er ALLOW, 2e BLOCK DOUBLON", ok, info)
+
+    # Test 15 : event CLOSE -> ALLOW (cloture forcee, flat anti-gap)
+    _reset_risk_state()
+    close_payload = {
+        "secret":     "test-secret-key-smc",
+        "event_type": "CLOSE",
+        "symbol":     "USTECs",
+        "timeframe":  "15",
+        "price":      20000.0,
+        "direction":  "bear",
+        "timestamp":  "2024-01-15T20:45:00Z",
+    }
+    with patch("bot.notifications.telegram._safe_send",
+               new=AsyncMock(return_value=None)), \
+         patch("bot.execution.mt5_forwarder.send_close",
+               new=AsyncMock(return_value=(True, "MT5 close USTECs - 1 position fermee", ""))):
+        result = await webhook.process(close_payload)
+    ok = result["status"] == "ALLOW" and result.get("event_type") == "CLOSE"
+    info = f"status={result['status']} reason={result.get('reason', '-')}" if not ok else ""
+    results.record("event CLOSE -> ALLOW (cloture forcee)", ok, info)
 
     # -----------------------------------------------------------------------
     # SCORE FINAL
