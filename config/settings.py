@@ -85,6 +85,9 @@ VALID_EVENT_TYPES = {
     "EMA_FILTER",
     "RANGE_BREAKOUT",
     "CLOSE",            # cloture forcee d'une position (ex. flat fin de session NASDAQ)
+    "BREAK_EVEN",       # gestion : SL ramene au prix d'entree
+    "TRAIL_SL",         # gestion : SL suiveur (trailing)
+    "PARTIAL_CLOSE",    # gestion : cloture partielle (TP partiel)
 }
 
 TRADEABLE_EVENTS = {
@@ -113,6 +116,7 @@ BLOCK_REASONS = {
     "ERREUR_TECHNIQUE":         "Erreur technique — trade bloqué par sécurité",
     "DOUBLON":                  "Webhook dupliqué par TradingView — signal déjà traité",
     "CLOTURE_ECHEC":            "L'executor MT5 n'a pas pu fermer la position",
+    "GESTION_ECHEC":            "L'executor MT5 n'a pas pu appliquer l'ordre de gestion",
 }
 
 # ---------------------------------------------------------------------------

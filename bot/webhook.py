@@ -44,7 +44,14 @@ FORCED_DIRECTIONS: dict[str, str | None] = {
     "SESSION_OPEN":   None,   # libre
     "RANGE_BREAKOUT": None,   # libre
     "CLOSE":          None,   # libre — clôture forcée
+    "BREAK_EVEN":     None,   # libre — gestion
+    "TRAIL_SL":       None,   # libre — gestion
+    "PARTIAL_CLOSE":  None,   # libre — gestion
 }
+
+# Événements de gestion en cours de trade (BE / trailing / TP partiel).
+# Routés vers l'executor sans passer par les filtres de trade.
+MANAGEMENT_EVENTS = {"BREAK_EVEN", "TRAIL_SL", "PARTIAL_CLOSE"}
 
 
 def _now_iso() -> str:
@@ -226,6 +233,17 @@ def _filter_validation(payload: dict) -> tuple[bool, str]:
                     f"({payload['event_type']}), reçu : {val}"
                 )
 
+    # Cohérence des événements de gestion
+    if payload["event_type"] == "TRAIL_SL":
+        tp = payload.get("trail_pips")
+        if not isinstance(tp, (int, float)) or tp <= 0:
+            return False, f"TRAIL_SL requiert trail_pips > 0, reçu : {tp}"
+
+    if payload["event_type"] == "PARTIAL_CLOSE":
+        cp = payload.get("close_pct")
+        if not isinstance(cp, (int, float)) or not (0 < cp < 100):
+            return False, f"PARTIAL_CLOSE requiert close_pct entre 0 et 100, reçu : {cp}"
+
     # Cohérence RANGE_BREAKOUT
     if payload["event_type"] == "RANGE_BREAKOUT":
         rh = payload.get("range_high")
@@ -375,6 +393,34 @@ async def process(payload: dict) -> dict:
             "status": "ALLOW",
             "signal_id": signal_id,
             "event_type": "CLOSE",
+            "symbol": signal["symbol"],
+            "detail": detail,
+            "filters_passed": filters_passed,
+            "timestamp": _now_iso(),
+        }
+
+    # --- Gestion en cours de trade (break-even / trailing / TP partiel) ---
+    # Le Pine émet ces événements au fil de la vie du trade. On ne re-décide
+    # rien : on relaie l'ordre de gestion à l'executor. Aucun filtre de trade
+    # (RISK inclus) — gérer une position ouverte ne crée pas de risque nouveau.
+    if signal["event_type"] in MANAGEMENT_EVENTS:
+        logger.info(
+            "%s reçu | id=%s | %s — gestion en cours de trade",
+            signal["event_type"], signal_id, signal["symbol"],
+        )
+        success, detail, err = await mt5_forwarder.send_manage(signal)
+        if not success:
+            await telegram.notify_error(
+                context=f"Gestion MT5 — {signal['event_type']} {signal['symbol']}",
+                error=err,
+            )
+            return _block(signal_id, signal, "GESTION_ECHEC", err, filters_passed)
+        logger.info("%s OK | id=%s | %s | %s",
+                    signal["event_type"], signal_id, signal["symbol"], detail)
+        return {
+            "status": "ALLOW",
+            "signal_id": signal_id,
+            "event_type": signal["event_type"],
             "symbol": signal["symbol"],
             "detail": detail,
             "filters_passed": filters_passed,

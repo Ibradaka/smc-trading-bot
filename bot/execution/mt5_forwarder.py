@@ -168,3 +168,57 @@ async def get_open_positions() -> int | None:
     logger.warning("Reconciliation : reponse executor invalide — %s",
                    data.get("error", f"HTTP {resp.status_code}"))
     return None
+
+
+async def send_manage(signal: dict) -> tuple[bool, str, str]:
+    """
+    Relaie un ordre de gestion en cours de trade a l'executor MT5 :
+      - BREAK_EVEN    -> /modify  (SL ramene au prix d'entree)
+      - TRAIL_SL      -> /modify  (SL suiveur a 'trail_pips' du prix courant)
+      - PARTIAL_CLOSE -> /partial_close  (ferme 'close_pct' % du volume)
+
+    Returns:
+        (success, description, error_message)
+    """
+    symbol = signal["symbol"]
+    event  = signal["event_type"]
+
+    if not MT5_EXECUTOR_URL:
+        return False, "", "MT5_EXECUTOR_URL non configure dans le .env"
+
+    if event == "PARTIAL_CLOSE":
+        url = MT5_EXECUTOR_URL.replace("/order", "/partial_close")
+        payload = {
+            "secret":    MT5_EXECUTOR_SECRET,
+            "symbol":    symbol,
+            "close_pct": float(signal.get("close_pct", 50.0)),
+        }
+    else:  # BREAK_EVEN ou TRAIL_SL
+        url = MT5_EXECUTOR_URL.replace("/order", "/modify")
+        payload = {
+            "secret":     MT5_EXECUTOR_SECRET,
+            "symbol":     symbol,
+            "mode":       "breakeven" if event == "BREAK_EVEN" else "trail",
+            "trail_pips": float(signal.get("trail_pips", 0.0)),
+        }
+
+    logger.info("Transmission gestion %s a l'executor MT5 : %s", event, symbol)
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.post(url, json=payload)
+        data = resp.json()
+    except httpx.TimeoutException:
+        return False, "", f"Timeout ({_TIMEOUT}s) — executor MT5 ne repond pas"
+    except Exception as exc:
+        logger.error("Erreur appel gestion executor MT5 : %s", exc, exc_info=True)
+        return False, "", str(exc)
+
+    if resp.status_code == 200 and data.get("success"):
+        desc = f"MT5 {event} {symbol} — {data.get('detail', 'ok')}"
+        logger.info("Executor MT5 OK — %s", desc)
+        return True, desc, ""
+
+    err = data.get("error", f"HTTP {resp.status_code}")
+    logger.error("Executor MT5 a refuse la gestion : %s", err)
+    return False, "", err

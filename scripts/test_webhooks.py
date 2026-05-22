@@ -383,6 +383,54 @@ async def run_all_tests() -> TestResult:
     results.record("Reconciliation : 3 positions MT5 -> BLOCK MAX_TRADES", ok, info)
 
     # -----------------------------------------------------------------------
+    # GESTION EN COURS DE TRADE
+    # -----------------------------------------------------------------------
+    print()
+    print(f"{BOLD}-- GESTION EN COURS DE TRADE ------------------------------{RESET}")
+
+    # Tests 17-19 : events de gestion -> ALLOW (relayes a l'executor)
+    mgmt_cases = [
+        {"event_type": "BREAK_EVEN"},
+        {"event_type": "TRAIL_SL", "trail_pips": 120.0},
+        {"event_type": "PARTIAL_CLOSE", "close_pct": 50.0},
+    ]
+    for i, extra in enumerate(mgmt_cases, start=17):
+        _reset_risk_state()
+        mp = {
+            "secret":    "test-secret-key-smc",
+            "symbol":    "XAUUSDs",
+            "timeframe": "15",
+            "price":     3000.0,
+            "direction": "bear",
+            "timestamp": f"2024-01-15T{i}:00:00Z",
+            **extra,
+        }
+        with patch("bot.notifications.telegram._safe_send",
+                   new=AsyncMock(return_value=None)), \
+             patch("bot.execution.mt5_forwarder.send_manage",
+                   new=AsyncMock(return_value=(True, "MT5 ok", ""))):
+            result = await webhook.process(mp)
+        ev = extra["event_type"]
+        ok = result["status"] == "ALLOW" and result.get("event_type") == ev
+        info = f"status={result['status']} reason={result.get('reason', '-')}" if not ok else ""
+        results.record(f"event {ev} -> ALLOW (gestion)", ok, info)
+
+    # Test 20 : TRAIL_SL sans trail_pips -> BLOCK PAYLOAD_INVALIDE
+    bad = {
+        "secret":    "test-secret-key-smc",
+        "event_type": "TRAIL_SL",
+        "symbol":    "XAUUSDs",
+        "timeframe": "15",
+        "price":     3000.0,
+        "direction": "bear",
+        "timestamp": "2024-01-15T21:30:00Z",
+    }
+    result = await run_test(bad, mock_time=_make_london_time())
+    ok = result["status"] == "BLOCK" and result.get("reason") == "PAYLOAD_INVALIDE"
+    info = f"status={result['status']} reason={result.get('reason', '-')}" if not ok else ""
+    results.record("TRAIL_SL sans trail_pips -> BLOCK PAYLOAD_INVALIDE", ok, info)
+
+    # -----------------------------------------------------------------------
     # SCORE FINAL
     # -----------------------------------------------------------------------
     _reset_risk_state()

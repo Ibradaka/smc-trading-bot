@@ -134,6 +134,19 @@ class PositionsRequest(BaseModel):
     secret: str
 
 
+class ModifyRequest(BaseModel):
+    secret: str
+    symbol: str
+    mode: str               # "breakeven" ou "trail"
+    trail_pips: float = 0.0
+
+
+class PartialCloseRequest(BaseModel):
+    secret: str
+    symbol: str
+    close_pct: float = 50.0
+
+
 # --- Endpoints -------------------------------------------------------------
 
 @app.get("/health")
@@ -364,6 +377,180 @@ def open_positions(req: PositionsRequest):
         "tickets": [p.ticket for p in bot_positions],
         "symbols": [p.symbol for p in bot_positions],
     }
+
+
+@app.post("/modify")
+def modify_position(req: ModifyRequest):
+    """
+    Modifie le SL des positions du bot (magic 13013) sur un symbole.
+      - mode "breakeven" : SL ramene au prix d'entree (+/- 1 pip)
+      - mode "trail"     : SL place a 'trail_pips' du prix courant
+
+    Garde-fou : le SL n'est applique QUE s'il bouge dans le sens favorable
+    (ne recule jamais). Un ordre de gestion en retard ne peut pas desserrer
+    un stop deja avance.
+    """
+    if not EXECUTOR_SECRET or req.secret != EXECUTOR_SECRET:
+        logger.warning("Requete /modify refusee : secret invalide")
+        return {"success": False, "error": "secret invalide"}
+
+    ok, err = ensure_mt5()
+    if not ok:
+        return {"success": False, "error": err}
+
+    symbol = req.symbol
+    if not mt5.symbol_select(symbol, True):
+        return {"success": False, "error": f"symbole {symbol} introuvable chez le broker"}
+
+    info = mt5.symbol_info(symbol)
+    pip  = PIP_SIZE.get(symbol)
+    if info is None or pip is None:
+        return {"success": False, "error": f"info/pip manquant pour {symbol}"}
+
+    positions = mt5.positions_get(symbol=symbol) or ()
+    bot_pos = [p for p in positions if p.magic == MAGIC]
+    if not bot_pos:
+        return {"success": True, "modified": 0, "detail": "aucune position a modifier"}
+
+    modified, skipped, errors = 0, 0, []
+    for pos in bot_pos:
+        is_buy = pos.type == mt5.POSITION_TYPE_BUY
+
+        if req.mode == "breakeven":
+            new_sl = pos.price_open + pip if is_buy else pos.price_open - pip
+        elif req.mode == "trail":
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                errors.append(f"ticket {pos.ticket} : pas de cotation")
+                continue
+            ref  = tick.bid if is_buy else tick.ask
+            dist = req.trail_pips * pip
+            new_sl = ref - dist if is_buy else ref + dist
+        else:
+            return {"success": False, "error": f"mode inconnu : {req.mode}"}
+
+        new_sl = round(new_sl, info.digits)
+
+        # Garde-fou anti-recul : on n'applique que si le SL se resserre.
+        cur_sl = pos.sl or 0.0
+        if cur_sl:
+            if is_buy and new_sl <= cur_sl:
+                skipped += 1
+                continue
+            if (not is_buy) and new_sl >= cur_sl:
+                skipped += 1
+                continue
+
+        result = mt5.order_send({
+            "action":   mt5.TRADE_ACTION_SLTP,
+            "symbol":   symbol,
+            "position": pos.ticket,
+            "sl":       new_sl,
+            "tp":       pos.tp,
+        })
+        if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+            modified += 1
+            logger.info("SL modifie (%s) : %s ticket=%s sl=%s",
+                        req.mode, symbol, pos.ticket, new_sl)
+        else:
+            rc = result.retcode if result else "None"
+            errors.append(f"ticket {pos.ticket} : retcode {rc}")
+
+    if errors:
+        logger.warning("Modify %s incomplet : %s", symbol, "; ".join(errors))
+        return {"success": False, "modified": modified, "error": "; ".join(errors)}
+
+    return {"success": True, "modified": modified,
+            "detail": f"{modified} SL modifie(s), {skipped} ignore(s) (deja avance)"}
+
+
+@app.post("/partial_close")
+def partial_close(req: PartialCloseRequest):
+    """
+    Ferme une fraction (close_pct %) des positions du bot sur un symbole.
+
+    Si le volume a fermer tombe sous le lot minimum du broker, le partiel
+    est IGNORE (success, skipped) : la position continue, geree par le
+    trailing. A petit capital, beaucoup de positions sont au lot mini et
+    ne peuvent pas etre fractionnees — c'est attendu.
+    """
+    if not EXECUTOR_SECRET or req.secret != EXECUTOR_SECRET:
+        logger.warning("Requete /partial_close refusee : secret invalide")
+        return {"success": False, "error": "secret invalide"}
+
+    ok, err = ensure_mt5()
+    if not ok:
+        return {"success": False, "error": err}
+
+    symbol = req.symbol
+    if not mt5.symbol_select(symbol, True):
+        return {"success": False, "error": f"symbole {symbol} introuvable chez le broker"}
+
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        return {"success": False, "error": f"pas d'info pour {symbol}"}
+
+    positions = mt5.positions_get(symbol=symbol) or ()
+    bot_pos = [p for p in positions if p.magic == MAGIC]
+    if not bot_pos:
+        return {"success": True, "closed": 0, "detail": "aucune position"}
+
+    fill_order = _filling_order(info)
+    step = info.volume_step or 0.01
+
+    closed, skipped, errors = 0, 0, []
+    for pos in bot_pos:
+        vol = round(round(pos.volume * (req.close_pct / 100.0) / step) * step, 2)
+
+        # Volume trop petit (lot mini) ou >= position entiere -> pas de partiel
+        if vol < info.volume_min or vol >= pos.volume:
+            skipped += 1
+            continue
+
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            errors.append(f"ticket {pos.ticket} : pas de cotation")
+            continue
+
+        is_buy     = pos.type == mt5.POSITION_TYPE_BUY
+        close_type = mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY
+        price      = tick.bid if is_buy else tick.ask
+
+        base = {
+            "action":    mt5.TRADE_ACTION_DEAL,
+            "symbol":    symbol,
+            "volume":    vol,
+            "type":      close_type,
+            "position":  pos.ticket,
+            "price":     round(price, info.digits),
+            "deviation": 30,
+            "magic":     MAGIC,
+            "comment":   "SMC partial",
+            "type_time": mt5.ORDER_TIME_GTC,
+        }
+
+        result = None
+        for filling in fill_order:
+            result = mt5.order_send(dict(base, type_filling=filling))
+            if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                break
+
+        if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+            closed += 1
+            logger.info("Cloture partielle : %s ticket=%s vol=%.2f / %.2f",
+                        symbol, pos.ticket, vol, pos.volume)
+        else:
+            rc = result.retcode if result else "None"
+            errors.append(f"ticket {pos.ticket} : retcode {rc}")
+
+    if errors:
+        logger.warning("Partial close %s incomplet : %s", symbol, "; ".join(errors))
+        return {"success": False, "closed": closed, "error": "; ".join(errors)}
+
+    detail = f"{closed} partiel(s)"
+    if skipped:
+        detail += f", {skipped} ignore(s) (volume trop petit pour un partiel)"
+    return {"success": True, "closed": closed, "skipped": skipped, "detail": detail}
 
 
 if __name__ == "__main__":
