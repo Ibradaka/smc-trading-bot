@@ -5,6 +5,14 @@
 // Auteur   : Ibradaka
 // Date     : 2026-05-19
 //
+// HOTFIX anti-gap (2026-05-22) :
+//   * use_eod_flat : flat de fin de session le VENDREDI uniquement (pas tous
+//     les jours). USTECs (CFD) cote ~24h -> seul le week-end est un vrai gap.
+//   * Le flat quotidien tronquait les trailing ATR gagnants : net 117$ -> 6$.
+//     Flat vendredi seul = garde le gain de semaine + supprime le gap week-end.
+//   * Cote bot : envoi d'un event "CLOSE" au webhook quand le flat se declenche
+//     -> l'executor ferme la position live (magic 13013).
+//
 // CHANGELOG v13 NASDAQ (re-calibrage depuis v13 GOLD) :
 //   * pip              : 0.1   -> 1.0     (1 point d'indice NASDAQ)
 //   * sl_min_pips      : 50    -> 30      (30 points min)
@@ -222,8 +230,8 @@ use_trail_atr  = input.bool(true, "Trailing ATR apres BE (v13)",                
      tooltip="V13 GOLD : apres BE+1R atteint, le stop suit close +/- trail_atr_mult x ATR14. Capture les gros mouvements gold.")
 trail_atr_mult = input.float(1.5, "Trail ATR multiplier",  minval=0.5, maxval=4.0, step=0.1, group=GRP_MGMT,
      tooltip="1.5 x ATR14 par defaut. Augmenter (2.0+) = trail plus large = moins de sorties prematurees. Reduire (1.0) = trail plus serre = capture moins de fluctuations.")
-use_eod_flat   = input.bool(true, "Flat fin de session (anti-gap)",                     group=GRP_MGMT,
-     tooltip="NASDAQ anti-gap : coupe toute position vers 20:45 UTC et bloque les nouvelles entrees apres 20:00 UTC. Evite de tenir une position pendant le gap d'ouverture (overnight / week-end) ou le SL peut etre traverse — perte >> risque vise.")
+use_eod_flat   = input.bool(true, "Flat week-end vendredi (anti-gap)",                   group=GRP_MGMT,
+     tooltip="NASDAQ anti-gap : le VENDREDI uniquement, coupe toute position vers 20:45 UTC et bloque les entrees apres 20:00 UTC. Evite de tenir une position pendant le gap de week-end (vendredi soir -> lundi) ou le SL peut etre traverse — perte >> risque vise. Pas de flat en semaine : USTECs cote 24h, inutile de tronquer les trailing ATR gagnants.")
 
 // --- Affichage ---
 show_dashboard     = input.bool(true,  "Dashboard statistiques",                         group=GRP_DISP)
@@ -331,11 +339,16 @@ in_session = not use_session or in_london or in_ny
 in_lo_raw         = not na(time(timeframe.period, "0700-1200", "UTC"))
 is_london_open_bar = in_lo_raw and not in_lo_raw[1]
 
-// NASDAQ anti-gap — fenetres de fin de session (US cash se termine 21:00 UTC)
-//   in_late_session : 20:00-21:00 UTC -> on n'ouvre plus de nouveau trade
-//   in_eod_window   : 20:45-21:00 UTC -> on coupe toute position encore ouverte
-in_late_session = not na(time(timeframe.period, "2000-2100", "UTC"))
-in_eod_window   = not na(time(timeframe.period, "2045-2100", "UTC"))
+// NASDAQ anti-gap — flat du VENDREDI uniquement.
+// USTECs (CFD) cote ~24h/24 : la fin de session cash US ne cree PAS de gap,
+// seul le week-end (vendredi soir -> lundi) est un vrai gap structurel.
+// On ne coupe donc PAS en semaine (sinon on tronque les trailing ATR gagnants),
+// uniquement le vendredi en fin de session.
+//   in_late_session : vendredi 20:00-21:00 UTC -> plus de nouvelle entree
+//   in_eod_window   : vendredi 20:45-21:00 UTC -> on coupe toute position ouverte
+is_friday       = dayofweek == dayofweek.friday
+in_late_session = is_friday and not na(time(timeframe.period, "2000-2100", "UTC"))
+in_eod_window   = is_friday and not na(time(timeframe.period, "2045-2100", "UTC"))
 
 // ============================================================
 // SECTION 5 — NIVEAUX INSTITUTIONNELS (PDH/PDL, ASR)
@@ -980,10 +993,10 @@ if (is_long_pos or is_short_pos) and not na(entry_sl) and not na(entry_tp)
                      stop    = trail_low_sl_short,
                      comment = "Trail ATR S")
 
-// --- NASDAQ anti-gap — flat force avant la cloture US -----------------------
-// Si une position est encore ouverte dans la fenetre 20:45-21:00 UTC, on la
-// coupe. Tenir une position pendant le gap overnight / week-end peut faire
-// traverser le SL et generer une perte tres superieure au risque vise.
+// --- NASDAQ anti-gap — flat du vendredi soir (avant le gap de week-end) -----
+// Le vendredi, si une position est encore ouverte dans la fenetre 20:45-21:00
+// UTC, on la coupe. Tenir une position pendant le week-end peut faire traverser
+// le SL au gap d'ouverture du lundi et generer une perte >> risque vise.
 eod_flat_now = use_eod_flat and in_eod_window and strategy.position_size != 0
 eod_flat_dir = strategy.position_size > 0 ? "bull" : "bear"
 if eod_flat_now
