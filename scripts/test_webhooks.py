@@ -237,6 +237,14 @@ async def run_all_tests() -> TestResult:
     info   = f"status={result['status']} reason={result.get('reason', '-')}" if not ok else ""
     results.record("Symbole GBPUSD non autorise -> BLOCK SYMBOLE_NON_AUTORISE", ok, info)
 
+    # Test 4b : Symbole WTIs autorise (v15.1 OIL) -> ne doit PAS etre bloque au filtre symbole
+    payload = dict(BASE_VALID_PAYLOAD)
+    payload["symbol"] = "WTIs"
+    result = await run_test(payload, mock_time=_make_london_time())
+    ok     = result.get("reason") != "SYMBOLE_NON_AUTORISE"
+    info   = f"status={result['status']} reason={result.get('reason', '-')}" if not ok else ""
+    results.record("Symbole WTIs autorise (4e marche) -> pas de blocage SYMBOLE_NON_AUTORISE", ok, info)
+
     # Test 5 : Heure hors session (03:00 UTC) -> HORS_SESSION
     payload = dict(BASE_VALID_PAYLOAD)
     result  = await run_test(payload, mock_time=_make_offhours_time())

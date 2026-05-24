@@ -57,16 +57,23 @@ Deux machines :
 
 ## Stratégies de production
 
-Trois stratégies, une par marché, chacune sur son chart TradingView 15M avec sa propre alerte.
+Quatre stratégies, une par marché, chacune sur son chart TradingView 15M avec sa propre alerte.
 
 | Marché | Fichier Pine | Symbole broker | Sens | Backtest (réf.) |
 |---|---|---|---|---|
 | **Or** | `tradingview/smc_strategy_v13_gold.pine` | `XAUUSDs` | longs + shorts | 32 tr · WR 53% · +577 $ · PF 2.2 |
 | **EUR/USD** | `tradingview/smc_strategy_v10.pine` | `EURUSDs` | shorts | 7 tr · WR 57% · +114 $ · PF 2.4 |
-| **NASDAQ** | `tradingview/smc_strategy_v13_nasdaq.pine` | `USTECs` | shorts | 10 tr · WR 70% · +93 $ · PF 2.3 |
+| **NASDAQ** (v13.1) | `tradingview/smc_strategy_v13_nasdaq.pine` | `USTECs` | shorts | 9 tr · WR 78% · +132 $ · **PF 3.34** |
+| **Pétrole WTI** (v15.1) | `tradingview/smc_strategy_v15_oil.pine` | `WTIs` | longs + shorts | 29 tr · WR 48% · +236 $ · **PF 1.59** (in-S) / **2.05** (OOS) |
 
 > Système **short-biased de retournement** : les longs ne sont rentables que sur
-> un marché qui trende proprement (l'or). Sélectif par design — ~1 signal / 3-4 jours.
+> un marché qui trende proprement (l'or et le pétrole). Sélectif par design —
+> ~3 signaux / semaine tous marchés confondus.
+>
+> Évolution 2026-05-24 : ajout du **pétrole WTI** (4e marché) + tuning **NASDAQ**
+> via ablation `h4_bos_lb` 10→20. Méthodologie : ablation 1-variable + hold-out
+> test sur la période récente. Voir `docs/backlog-ameliorations.md` pour la
+> roadmap complète.
 
 Chaque script porte un groupe d'inputs **Webhook** (clé secrète, symbole broker,
 timeframe) et émet un payload JSON via `alert()`.
@@ -124,7 +131,7 @@ absolus — pour rester insensible à l'écart de prix entre TradingView et le b
 |---|---|
 | Capital initial | 3 000 € |
 | Risque par trade | 1 % → 30 € |
-| Max trades simultanés | 3 (un par marché) |
+| Max trades simultanés | 3 (4 marchés disponibles, 3 positions max actives) |
 | Daily drawdown limit | 3 % → arrêt |
 | Weekly drawdown limit | 6 % → pause 48 h |
 

@@ -59,6 +59,11 @@ ALLOWED_SYMBOLS = {
         "sessions": ["ny"],
         "pip_value_per_lot": 1.0,    # US Tech 100 — 1 contrat x 1 point = 1$/point/lot
     },
+    "WTIs": {
+        "priority": "medium",
+        "sessions": ["london", "ny"],
+        "pip_value_per_lot": 10.0,   # WTI Spot — 1000 barils/lot x 0.01$/pip = 10$/pip/lot
+    },
 }
 
 # ---------------------------------------------------------------------------

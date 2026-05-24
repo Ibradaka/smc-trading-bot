@@ -58,6 +58,7 @@ PIP_SIZE = {
     "XAUUSDs": 0.1,
     "EURUSDs": 0.0001,
     "USTECs":  1.0,
+    "WTIs":    0.01,    # WTI Spot — 1 pip = 0.01$ = 1 cent (tick 0.001, 10 ticks = 1 pip)
 }
 
 app = FastAPI(title="SMC MT5 Executor")
