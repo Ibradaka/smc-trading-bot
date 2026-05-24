@@ -8,7 +8,7 @@ Maintient l'état interne du bot (en mémoire, réinitialisé au redémarrage) :
   - Timestamp de fin de pause weekly (si active)
 
 Règles appliquées :
-  1. MAX_TRADES_ATTEINT   → 3 trades simultanés ouverts
+  1. MAX_TRADES_ATTEINT   → 4 trades simultanés ouverts (1 par marché)
   2. DAILY_DD_ATTEINT     → perte du jour ≥ 90 € (3% de 3000 €)
   3. WEEKLY_DD_ATTEINT    → perte de la semaine ≥ 180 € (6%) ou pause active
 

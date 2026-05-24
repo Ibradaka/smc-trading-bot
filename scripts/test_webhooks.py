@@ -268,15 +268,15 @@ async def run_all_tests() -> TestResult:
     info   = f"status={result['status']} reason={result.get('reason', '-')}" if not ok else ""
     results.record("RR = 1.2 (minimum 2.0) -> BLOCK RR_INSUFFISANT", ok, info)
 
-    # Test 8 : 3 trades deja ouverts -> MAX_TRADES_ATTEINT (MAX_TRADES = 3)
+    # Test 8 : 4 trades deja ouverts -> MAX_TRADES_ATTEINT (MAX_TRADES = 4)
     # Ne pas appeler run_test() (qui fait _reset_risk_state), injecter directement
     _reset_risk_state()
-    risk_state._open_trades = 3
+    risk_state._open_trades = 4
     payload = dict(BASE_VALID_PAYLOAD)
     result  = await _run_pipeline(payload, mock_time=_make_london_time())
     ok      = result["status"] == "BLOCK" and result.get("reason") == "MAX_TRADES_ATTEINT"
     info    = f"status={result['status']} reason={result.get('reason', '-')}" if not ok else ""
-    results.record("3 trades deja ouverts -> BLOCK MAX_TRADES_ATTEINT", ok, info)
+    results.record("4 trades deja ouverts -> BLOCK MAX_TRADES_ATTEINT", ok, info)
 
     # Test 9 : Drawdown jour = 95 EUR (depasse limite 90 EUR) -> DAILY_DD_ATTEINT
     _reset_risk_state()

@@ -131,7 +131,7 @@ absolus — pour rester insensible à l'écart de prix entre TradingView et le b
 |---|---|
 | Capital initial | 3 000 € |
 | Risque par trade | 1 % → 30 € |
-| Max trades simultanés | 3 (4 marchés disponibles, 3 positions max actives) |
+| Max trades simultanés | 4 (un par marché : gold, eurusd, nasdaq, wti) |
 | Daily drawdown limit | 3 % → arrêt |
 | Weekly drawdown limit | 6 % → pause 48 h |
 

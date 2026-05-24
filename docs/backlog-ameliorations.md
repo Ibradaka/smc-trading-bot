@@ -124,7 +124,7 @@ DXY déjà partiellement intégré dans `v13_gold.pine` (`use_dxy_filter`, désa
 
 **But** : éviter d'avoir 3 shorts simultanés corrélés via USD (XAU + EUR + NASDAQ sur un spike DXY) qui ne sont pas 3 trades mais 1 pari ×3.
 
-**Faible priorité car** : seulement 3 marchés, ~1.7 trade/semaine, simultanéité rare. `MAX_TRADES=3` plafonne déjà l'exposition.
+**Faible priorité car** : 4 marchés, ~3 trades/semaine, simultanéité rare. `MAX_TRADES=4` plafonne déjà l'exposition.
 
 **Effort** : 1 journée (calcul corrélation glissante sur fenêtre 30j, blocage si 2+ trades déjà ouverts dans actifs >0.7 corrélés).
 
