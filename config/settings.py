@@ -87,6 +87,7 @@ VALID_EVENT_TYPES = {
     "BOS_BULL",
     "BOS_BEAR",
     "SESSION_OPEN",
+    "SESSION_CLOSE",    # cloture de session (London ou NY) -> notif Telegram, pas d'ordre
     "EMA_FILTER",
     "RANGE_BREAKOUT",
     "CLOSE",            # cloture forcee d'une position (ex. flat fin de session NASDAQ)

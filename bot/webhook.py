@@ -42,6 +42,7 @@ FORCED_DIRECTIONS: dict[str, str | None] = {
     "BOS_BULL":       "bull",
     "BOS_BEAR":       "bear",
     "SESSION_OPEN":   None,   # libre
+    "SESSION_CLOSE":  None,   # libre — notif clôture session
     "RANGE_BREAKOUT": None,   # libre
     "CLOSE":          None,   # libre — clôture forcée
     "BREAK_EVEN":     None,   # libre — gestion
@@ -368,6 +369,27 @@ async def process(payload: dict) -> dict:
             "event_type": "SESSION_OPEN",
             "symbol": signal.get("symbol"),
             "detail": "Événement de gestion interne — aucun ordre envoyé",
+            "filters_passed": filters_passed,
+            "timestamp": _now_iso(),
+        }
+
+    if signal["event_type"] == "SESSION_CLOSE":
+        logger.info(
+            "SESSION_CLOSE reçu — %s | session=%s",
+            signal.get("symbol"),
+            signal.get("session", "?"),
+        )
+        await telegram.notify_session_close(
+            session=signal.get("session", "?"),
+            symbol=signal.get("symbol", ""),
+        )
+        filters_passed.extend(["SESSION", "EMA", "RR", "RISK"])
+        return {
+            "status": "ALLOW",
+            "signal_id": signal_id,
+            "event_type": "SESSION_CLOSE",
+            "symbol": signal.get("symbol"),
+            "detail": "Événement de notification — aucun ordre envoyé",
             "filters_passed": filters_passed,
             "timestamp": _now_iso(),
         }

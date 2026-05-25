@@ -145,6 +145,19 @@ async def notify_session_open(session: str, symbol: str, ema_value: float, direc
     await _safe_send(text)
 
 
+async def notify_session_close(session: str, symbol: str) -> None:
+    """Clôture de session — confirmation que le marché ferme sa fenêtre active."""
+    emoji = "🇬🇧" if session == "london" else "🇺🇸"
+    text = (
+        f"{emoji} <b>SESSION {session.upper()} FERMÉE</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Symbole :</b> {symbol}\n"
+        f"<b>Heure :</b> {_now_utc()}\n"
+        f"Bot toujours en écoute pour les sessions suivantes."
+    )
+    await _safe_send(text)
+
+
 async def notify_trade_closed(
     trade_id: str,
     symbol: str,

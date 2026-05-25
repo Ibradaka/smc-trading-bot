@@ -1132,6 +1132,35 @@ if mgmt_tp1_now
 if mgmt_struct_now
     alert(wh_msg_struct, alert.freq_once_per_bar_close)
 
+// ===== Notifications SESSION_OPEN / SESSION_CLOSE (heartbeat session) =====
+// Emet des webhooks aux transitions in_session = false<->true
+// -> Telegram informe que la fenetre active s'ouvre / se ferme.
+// Aucun ordre n'est place, c'est purement informatif (idem SESSION_OPEN historique).
+var bool _was_in_session = false
+var bool _was_in_ny      = false
+
+sess_open_now  = in_session and not _was_in_session and barstate.isconfirmed
+sess_close_now = not in_session and _was_in_session and barstate.isconfirmed
+
+wh_sess_name_open  = in_london ? "london" : "ny"
+wh_sess_name_close = _was_in_ny ? "ny" : "london"
+
+wh_msg_sess_open  = '{"secret":"' + wh_secret + '","event_type":"SESSION_OPEN","symbol":"' + wh_symbol +
+     '","timeframe":"' + wh_tf + '","price":' + str.tostring(close) +
+     ',"direction":"bull","session":"' + wh_sess_name_open + '","timestamp":"' + wh_ts + '"}'
+
+wh_msg_sess_close = '{"secret":"' + wh_secret + '","event_type":"SESSION_CLOSE","symbol":"' + wh_symbol +
+     '","timeframe":"' + wh_tf + '","price":' + str.tostring(close) +
+     ',"direction":"bull","session":"' + wh_sess_name_close + '","timestamp":"' + wh_ts + '"}'
+
+if sess_open_now
+    alert(wh_msg_sess_open,  alert.freq_once_per_bar_close)
+if sess_close_now
+    alert(wh_msg_sess_close, alert.freq_once_per_bar_close)
+
+_was_in_session := in_session
+_was_in_ny      := in_ny
+
 // Alertes texte simples (debug / supervision)
 alertcondition(enter_long,  title="SMC v13 GOLD LONG",  message="SMC v13 GOLD LONG {{ticker}}")
 alertcondition(enter_short, title="SMC v13 GOLD SHORT", message="SMC v13 GOLD SHORT {{ticker}}")
