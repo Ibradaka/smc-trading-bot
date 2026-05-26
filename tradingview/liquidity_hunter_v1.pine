@@ -1,0 +1,579 @@
+// ============================================================
+// Liquidity Hunter v1 — Stop Hunt Reversal (BTCUSD 5M)
+// Projet   : SMC Trading Bot — R&D exploratoire
+// Version  : 1.0.0
+// Auteur   : Ibradaka
+// Date     : 2026-05-25
+//
+// CONCEPT :
+//   Strategie de retournement basee sur le liquidity sweep.
+//   Les institutions chassent les stops retail au-dela des swing
+//   highs/lows evidents, puis retournent dans la vraie direction.
+//
+// SEQUENCE :
+//   1. Identifier swing high/low evident sur 15M (liquidite accumulee)
+//   2. Le prix casse le niveau de 0.03-0.15% (fake breakout = sweep)
+//   3. Le prix cloture de retour sous/sur le niveau (reversal)
+//   4. Confirmation (bougie suivante) + filtre EMA 1H
+//   5. Entree avec SL au-dela du sweep, TP1 50% a +1.5R, TP2 50% a +2.5R
+//   6. Breakeven apres TP1 touche
+//
+// SAFETY :
+//   - Max trades/jour, max pertes consecutives
+//   - News filter (13:30 UTC + 15:00 UTC zones mortes)
+//   - Double sweep cooldown
+//
+// CIBLE : BTCUSD 5M, periode max disponible
+// OBJECTIFS : WR > 55%, PF > 1.5, RR moyen > 1:1.5, DD < 12%
+// ============================================================
+
+//@version=6
+strategy(
+     title                   = "Liquidity Hunter v1 — Stop Hunt Reversal",
+     shorttitle              = "LIQ-H v1",
+     overlay                 = true,
+     initial_capital         = 3000,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 1,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.04,
+     slippage                = 1,
+     process_orders_on_close = true,
+     max_bars_back           = 500,
+     pyramiding              = 0
+ )
+
+// ============================================================
+// SECTION 2 — PARAMETRES CONFIGURABLES
+// ============================================================
+
+var string GRP_DETECT  = "Detection swings"
+var string GRP_SWEEP   = "Sweep"
+var string GRP_ENTRY   = "Entry"
+var string GRP_SESSION = "Session"
+var string GRP_RISK    = "Risk management"
+var string GRP_SAFETY  = "Safety"
+var string GRP_DISP    = "Display"
+var string GRP_COLORS  = "Colors"
+
+// --- Detection swing (sur donnees 15M via request.security) ---
+swing_lookback   = input.int(10,    "Swing lookback (bougies 15M)",     minval=3,  maxval=30,  group=GRP_DETECT)
+min_touches      = input.int(2,     "Touches min pour zone valide",      minval=1,  maxval=5,   group=GRP_DETECT)
+price_tolerance  = input.float(0.05,"Tolerance prix zone (%)",           minval=0.01,maxval=0.2,step=0.01,group=GRP_DETECT,
+     tooltip="% du prix pour grouper les niveaux similaires (ex 0.05% sur BTC 100k = 50 USD)")
+zone_max_age     = input.int(200,   "Age max zone (bougies 5M)",         minval=50, maxval=500, group=GRP_DETECT)
+
+// --- Sweep parameters ---
+sweep_min_pips   = input.float(0.03,"Sweep min (% du prix)",             minval=0.01,maxval=0.1, step=0.01,group=GRP_SWEEP,
+     tooltip="Depassement minimum du niveau en % du prix (ex 0.03% sur BTC 100k = 30 USD)")
+sweep_max_pips   = input.float(0.15,"Sweep max (% du prix)",             minval=0.05,maxval=0.5, step=0.01,group=GRP_SWEEP,
+     tooltip="Au-dela = breakout reel, pas un sweep")
+wick_ratio       = input.float(0.5, "Ratio meche min",                   minval=0.3, maxval=0.8, step=0.05,group=GRP_SWEEP,
+     tooltip="Meche du sweep > X% de la range totale")
+
+// --- Confirmation / filtres ---
+use_confirmation = input.bool(true, "Attendre bougie de confirmation",   group=GRP_ENTRY,
+     tooltip="Attendre 1 bougie supplementaire apres le sweep")
+use_ema_filter   = input.bool(true, "Filtre EMA 1H directionnel",        group=GRP_ENTRY)
+ema_period_h1    = input.int(50,    "Periode EMA 1H",                    minval=20,  maxval=200, group=GRP_ENTRY)
+
+// --- Session ---
+session_start    = input.int(7,     "Session start (UTC)",               minval=0,   maxval=23,  group=GRP_SESSION)
+session_end      = input.int(17,    "Session end (UTC)",                 minval=1,   maxval=24,  group=GRP_SESSION)
+
+// --- Risk ---
+risk_pct         = input.float(1.0, "Risque par trade (% equity)",       minval=0.5, maxval=3.0, step=0.5, group=GRP_RISK)
+sl_buffer_pct    = input.float(0.02,"SL buffer au-dela du sweep (%)",    minval=0.01,maxval=0.1, step=0.01,group=GRP_RISK)
+tp1_rr           = input.float(1.5, "TP1 — ratio RR (50% position)",     minval=1.0, maxval=3.0, step=0.1, group=GRP_RISK)
+tp2_rr           = input.float(2.5, "TP2 — ratio RR (50% restant)",      minval=1.5, maxval=5.0, step=0.1, group=GRP_RISK)
+use_breakeven    = input.bool(true, "BE apres TP1",                      group=GRP_RISK)
+max_trades_day   = input.int(6,     "Max trades par jour",               minval=1,   maxval=15,  group=GRP_RISK)
+max_consec_loss  = input.int(2,     "Stop apres X pertes consecutives",  minval=1,   maxval=5,   group=GRP_RISK)
+
+// --- Safety ---
+use_news_filter  = input.bool(true, "Bloquer pendant heures news",       group=GRP_SAFETY,
+     tooltip="Bloque 13:00-14:00 et 14:30-15:30 UTC (NFP / CPI / FOMC zone)")
+double_sweep_cooldown = input.int(30,"Cooldown apres sweep echoue (bougies)",minval=10,maxval=60,group=GRP_SAFETY)
+
+// --- Display ---
+show_zones       = input.bool(true, "Afficher zones de liquidite",       group=GRP_DISP)
+show_sweeps      = input.bool(true, "Afficher labels sweep",             group=GRP_DISP)
+show_table       = input.bool(true, "Afficher tableau stats",            group=GRP_DISP)
+
+// --- Couleurs ---
+col_high_quality = input.color(color.yellow, "Haute qualite (3+ touches)", group=GRP_COLORS)
+col_med_quality  = input.color(color.blue,   "Qualite moyenne (2 touches)",group=GRP_COLORS)
+col_double_top   = input.color(color.purple, "Double top/bottom",          group=GRP_COLORS)
+col_round_number = input.color(color.green,  "Nombre rond",                group=GRP_COLORS)
+
+// ============================================================
+// SECTION 3 — UTILITAIRES
+// ============================================================
+
+f_in_session() =>
+    h = hour(time, "UTC")
+    m = minute(time, "UTC")
+    total = h * 60 + m
+    total >= session_start * 60 and total < session_end * 60
+
+// Filtre news : bloque autour des heures typiques US (13:30 et 15:00 UTC)
+f_news_blocked() =>
+    if not use_news_filter
+        false
+    else
+        h = hour(time, "UTC")
+        m = minute(time, "UTC")
+        total = h * 60 + m
+        (total >= 13*60 and total <= 14*60) or (total >= 14*60+30 and total <= 15*60+30)
+
+// Detection nombre rond BTC (.0000 ou .5000 sur tranche 1000)
+f_is_round_number(price) =>
+    remainder = price - math.floor(price / 1000) * 1000
+    remainder < 50 or remainder > 950 or math.abs(remainder - 500) < 50
+
+// ============================================================
+// SECTION 4 — DETECTION SWING HIGHS/LOWS MULTI-TOUCH (15M)
+// ============================================================
+
+high_15m = request.security(syminfo.tickerid, "15", ta.pivothigh(high, swing_lookback, swing_lookback), lookahead=barmerge.lookahead_off)
+low_15m  = request.security(syminfo.tickerid, "15", ta.pivotlow( low,  swing_lookback, swing_lookback), lookahead=barmerge.lookahead_off)
+
+// Arrays de stockage (10 plus recents niveaux + compteur touches + age en bougies 5M)
+var swing_highs = array.new_float(10, na)
+var swing_lows  = array.new_float(10, na)
+var sh_touches  = array.new_int(10, 0)
+var sl_touches  = array.new_int(10, 0)
+var sh_age      = array.new_int(10, 0)
+var sl_age      = array.new_int(10, 0)
+
+// --- Helper : ajoute ou met a jour un swing high ---
+// Retourne true (terminateur void pour compat type Pine v6 if/else).
+f_add_or_update_high(new_level) =>
+    var bool _dummy_h = true
+    if not na(new_level)
+        // Cherche si un niveau similaire existe
+        matched_idx = -1
+        tol_abs = close * price_tolerance / 100
+        for i = 0 to 9
+            existing = array.get(swing_highs, i)
+            if not na(existing) and math.abs(existing - new_level) <= tol_abs
+                matched_idx := i
+                break
+        if matched_idx >= 0
+            // Niveau existant -> incrementer touches, rafraichir age
+            array.set(sh_touches, matched_idx, array.get(sh_touches, matched_idx) + 1)
+            array.set(sh_age,     matched_idx, 0)
+            true
+        else
+            // Nouveau niveau -> shift array + insertion en tete
+            array.unshift(swing_highs, new_level)
+            array.unshift(sh_touches, 1)
+            array.unshift(sh_age, 0)
+            // Garde uniquement les 10 plus recents
+            if array.size(swing_highs) > 10
+                array.pop(swing_highs)
+                array.pop(sh_touches)
+                array.pop(sh_age)
+            true
+    _dummy_h
+
+f_add_or_update_low(new_level) =>
+    var bool _dummy_l = true
+    if not na(new_level)
+        matched_idx = -1
+        tol_abs = close * price_tolerance / 100
+        for i = 0 to 9
+            existing = array.get(swing_lows, i)
+            if not na(existing) and math.abs(existing - new_level) <= tol_abs
+                matched_idx := i
+                break
+        if matched_idx >= 0
+            array.set(sl_touches, matched_idx, array.get(sl_touches, matched_idx) + 1)
+            array.set(sl_age,     matched_idx, 0)
+            true
+        else
+            array.unshift(swing_lows, new_level)
+            array.unshift(sl_touches, 1)
+            array.unshift(sl_age, 0)
+            if array.size(swing_lows) > 10
+                array.pop(swing_lows)
+                array.pop(sl_touches)
+                array.pop(sl_age)
+            true
+    _dummy_l
+
+// Detection nouveau pivot (transition na -> non-na)
+new_pivot_high = not na(high_15m) and na(high_15m[1])
+new_pivot_low  = not na(low_15m)  and na(low_15m[1])
+
+if new_pivot_high
+    f_add_or_update_high(high_15m)
+if new_pivot_low
+    f_add_or_update_low(low_15m)
+
+// Vieillissement + nettoyage des zones expirees a chaque bougie 5M
+if barstate.isconfirmed
+    for i = 0 to 9
+        if not na(array.get(swing_highs, i))
+            array.set(sh_age, i, array.get(sh_age, i) + 1)
+            if array.get(sh_age, i) > zone_max_age
+                array.set(swing_highs, i, na)
+                array.set(sh_touches,  i, 0)
+                array.set(sh_age,      i, 0)
+        if not na(array.get(swing_lows, i))
+            array.set(sl_age, i, array.get(sl_age, i) + 1)
+            if array.get(sl_age, i) > zone_max_age
+                array.set(swing_lows, i, na)
+                array.set(sl_touches, i, 0)
+                array.set(sl_age,     i, 0)
+
+// ============================================================
+// SECTION 5 — DETECTION DU SWEEP
+// ============================================================
+
+// Variables de sortie de detection
+var float sweep_level_high   = na
+var float sweep_extreme_high = na
+var float sweep_level_low    = na
+var float sweep_extreme_low  = na
+
+sweep_high_detected = false
+sweep_low_detected  = false
+
+if barstate.isconfirmed
+    range_total = high - low
+    // SWEEP HIGH (setup SHORT)
+    for i = 0 to 9
+        lvl = array.get(swing_highs, i)
+        touches = array.get(sh_touches, i)
+        if not na(lvl) and touches >= min_touches and not sweep_high_detected
+            sweep_dist_pct = (high - lvl) / lvl * 100
+            wick_up = high - math.max(close, open)
+            cond_dist  = sweep_dist_pct >= sweep_min_pips and sweep_dist_pct <= sweep_max_pips
+            cond_close = close < lvl
+            cond_bear  = close < open
+            cond_wick  = range_total > 0 and wick_up >= wick_ratio * range_total
+            if cond_dist and cond_close and cond_bear and cond_wick
+                sweep_high_detected := true
+                sweep_level_high   := lvl
+                sweep_extreme_high := high
+
+    // SWEEP LOW (setup LONG)
+    for i = 0 to 9
+        lvl = array.get(swing_lows, i)
+        touches = array.get(sl_touches, i)
+        if not na(lvl) and touches >= min_touches and not sweep_low_detected
+            sweep_dist_pct = (lvl - low) / lvl * 100
+            wick_dn = math.min(close, open) - low
+            cond_dist  = sweep_dist_pct >= sweep_min_pips and sweep_dist_pct <= sweep_max_pips
+            cond_close = close > lvl
+            cond_bull  = close > open
+            cond_wick  = range_total > 0 and wick_dn >= wick_ratio * range_total
+            if cond_dist and cond_close and cond_bull and cond_wick
+                sweep_low_detected := true
+                sweep_level_low   := lvl
+                sweep_extreme_low := low
+
+// ============================================================
+// SECTION 6 — CONFIRMATION + FILTRES
+// ============================================================
+
+// EMA 1H directionnel
+ema_1h = request.security(syminfo.tickerid, "60", ta.ema(close, ema_period_h1), lookahead=barmerge.lookahead_off)
+ema_ok_long  = not use_ema_filter or close > ema_1h
+ema_ok_short = not use_ema_filter or close < ema_1h
+
+// Pending setups (attendre bougie de confirmation)
+var bool  pending_long       = false
+var bool  pending_short      = false
+var float pending_sl_long    = na
+var float pending_sl_short   = na
+var float pending_level_long = na
+var float pending_level_short= na
+
+if sweep_low_detected
+    pending_long       := true
+    pending_sl_long    := sweep_extreme_low - (close * sl_buffer_pct / 100)
+    pending_level_long := sweep_level_low
+
+if sweep_high_detected
+    pending_short       := true
+    pending_sl_short    := sweep_extreme_high + (close * sl_buffer_pct / 100)
+    pending_level_short := sweep_level_high
+
+// Compteur trades journalier + pertes consecutives
+var int trades_today    = 0
+var int consec_losses   = 0
+var int last_trade_day  = na
+var int prev_closed_n   = 0
+
+current_day = dayofmonth(time)
+if not na(last_trade_day) and current_day != last_trade_day
+    trades_today := 0
+    consec_losses := 0
+last_trade_day := current_day
+
+// Detection cloture trade (changement strategy.closedtrades) pour mettre a jour stats
+if strategy.closedtrades > prev_closed_n
+    last_trade_idx = strategy.closedtrades - 1
+    last_pnl = strategy.closedtrades.profit(last_trade_idx)
+    trades_today += 1
+    if last_pnl < 0
+        consec_losses += 1
+    else
+        consec_losses := 0
+    prev_closed_n := strategy.closedtrades
+
+trade_allowed = trades_today < max_trades_day and consec_losses < max_consec_loss and not f_news_blocked() and f_in_session()
+
+// Double sweep protection : si dernier trade perdant a la suite d'un sweep, cooldown
+var int last_failed_sweep_bar = -10000
+if strategy.closedtrades > 0
+    last_pnl_chk = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    exit_bar = strategy.closedtrades.exit_bar_index(strategy.closedtrades - 1)
+    if last_pnl_chk < 0 and exit_bar > last_failed_sweep_bar
+        last_failed_sweep_bar := exit_bar
+
+double_sweep_ok = (bar_index - last_failed_sweep_bar) > double_sweep_cooldown
+
+// ============================================================
+// SECTION 7 — SIGNAUX D'ENTREE FINAUX
+// ============================================================
+
+long_trigger = use_confirmation ? (pending_long[1] and close > open) : sweep_low_detected
+short_trigger = use_confirmation ? (pending_short[1] and close < open) : sweep_high_detected
+
+long_signal  = long_trigger  and ema_ok_long  and trade_allowed and double_sweep_ok and strategy.position_size == 0
+short_signal = short_trigger and ema_ok_short and trade_allowed and double_sweep_ok and strategy.position_size == 0
+
+// ============================================================
+// SECTION 8 — SL / TP / ENTRIES
+// ============================================================
+
+var float entry_price = na
+var float entry_sl    = na
+var float entry_tp1   = na
+var float entry_tp2   = na
+var bool  tp1_hit     = false
+
+if long_signal
+    sl_long  = use_confirmation ? pending_sl_long[1]  : pending_sl_long
+    entry_price := close
+    entry_sl    := sl_long
+    sl_dist     = entry_price - entry_sl
+    entry_tp1  := entry_price + sl_dist * tp1_rr
+    entry_tp2  := entry_price + sl_dist * tp2_rr
+    tp1_hit    := false
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long TP1", from_entry="Long", qty_percent=50, limit=entry_tp1, stop=entry_sl, comment_loss="SL Long", comment_profit="TP1 Long")
+    strategy.exit("Long TP2", from_entry="Long",                  limit=entry_tp2, stop=entry_sl, comment_loss="SL Long", comment_profit="TP2 Long")
+    pending_long := false
+
+if short_signal
+    sl_short = use_confirmation ? pending_sl_short[1] : pending_sl_short
+    entry_price := close
+    entry_sl    := sl_short
+    sl_dist     = entry_sl - entry_price
+    entry_tp1  := entry_price - sl_dist * tp1_rr
+    entry_tp2  := entry_price - sl_dist * tp2_rr
+    tp1_hit    := false
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short TP1", from_entry="Short", qty_percent=50, limit=entry_tp1, stop=entry_sl, comment_loss="SL Short", comment_profit="TP1 Short")
+    strategy.exit("Short TP2", from_entry="Short",                 limit=entry_tp2, stop=entry_sl, comment_loss="SL Short", comment_profit="TP2 Short")
+    pending_short := false
+
+// Breakeven : si TP1 deja touche (qty restant = 50%) et use_breakeven actif
+if use_breakeven and strategy.position_size != 0 and not tp1_hit
+    cur_position_abs = math.abs(strategy.position_size)
+    initial_qty_proxy = cur_position_abs * 2  // approximatif : 50% initial reste
+    // Detection grossiere : si la position en valeur absolue est ~50% du max recent
+    // Pine ne donne pas directement "TP1 hit" -> on detecte via price reaching TP1
+    if strategy.position_size > 0 and high >= entry_tp1
+        tp1_hit := true
+        strategy.exit("Long BE", from_entry="Long", stop=entry_price + (close * 0.01 / 100), limit=entry_tp2)
+    if strategy.position_size < 0 and low <= entry_tp1
+        tp1_hit := true
+        strategy.exit("Short BE", from_entry="Short", stop=entry_price - (close * 0.01 / 100), limit=entry_tp2)
+
+// ============================================================
+// SECTION 9 — AFFICHAGE ZONES DE LIQUIDITE
+// ============================================================
+
+// Boxes persistants par zone (utilises pour le rendu)
+var box[] sh_boxes = array.new_box(10, na)
+var box[] sl_boxes = array.new_box(10, na)
+var label[] sh_labels = array.new_label(10, na)
+var label[] sl_labels = array.new_label(10, na)
+
+if show_zones and barstate.islast
+    tol_abs = close * price_tolerance / 100
+    for i = 0 to 9
+        // Cleanup ancien box
+        old_sh = array.get(sh_boxes, i)
+        if not na(old_sh)
+            box.delete(old_sh)
+            array.set(sh_boxes, i, na)
+        old_sl = array.get(sl_boxes, i)
+        if not na(old_sl)
+            box.delete(old_sl)
+            array.set(sl_boxes, i, na)
+        old_sh_lbl = array.get(sh_labels, i)
+        if not na(old_sh_lbl)
+            label.delete(old_sh_lbl)
+            array.set(sh_labels, i, na)
+        old_sl_lbl = array.get(sl_labels, i)
+        if not na(old_sl_lbl)
+            label.delete(old_sl_lbl)
+            array.set(sl_labels, i, na)
+
+        // Highs
+        h_lvl = array.get(swing_highs, i)
+        h_t   = array.get(sh_touches, i)
+        if not na(h_lvl)
+            base_col = h_t >= 3 ? col_high_quality : col_med_quality
+            if f_is_round_number(h_lvl)
+                base_col := col_round_number
+            new_box = box.new(left=bar_index - 100, top=h_lvl + tol_abs, right=bar_index + 20, bottom=h_lvl - tol_abs, bgcolor=color.new(base_col, 80), border_color=color.new(base_col, 50))
+            array.set(sh_boxes, i, new_box)
+            new_lbl = label.new(x=bar_index + 20, y=h_lvl, text=str.tostring(h_t) + "x", color=color.new(base_col, 30), textcolor=color.white, size=size.small, style=label.style_label_left)
+            array.set(sh_labels, i, new_lbl)
+
+        // Lows
+        l_lvl = array.get(swing_lows, i)
+        l_t   = array.get(sl_touches, i)
+        if not na(l_lvl)
+            base_col2 = l_t >= 3 ? col_high_quality : col_med_quality
+            if f_is_round_number(l_lvl)
+                base_col2 := col_round_number
+            new_box2 = box.new(left=bar_index - 100, top=l_lvl + tol_abs, right=bar_index + 20, bottom=l_lvl - tol_abs, bgcolor=color.new(base_col2, 80), border_color=color.new(base_col2, 50))
+            array.set(sl_boxes, i, new_box2)
+            new_lbl2 = label.new(x=bar_index + 20, y=l_lvl, text=str.tostring(l_t) + "x", color=color.new(base_col2, 30), textcolor=color.white, size=size.small, style=label.style_label_left)
+            array.set(sl_labels, i, new_lbl2)
+
+// Labels sweep dynamiques
+if show_sweeps
+    if sweep_high_detected
+        label.new(bar_index, high, "⚡ SWEEP HIGH", color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
+    if sweep_low_detected
+        label.new(bar_index, low, "⚡ SWEEP LOW", color=color.green, textcolor=color.white, style=label.style_label_up, size=size.small)
+
+// ============================================================
+// SECTION 10 — ALERTCONDITIONS
+// ============================================================
+
+alertcondition(sweep_high_detected, title="⚡ SWEEP HIGH — Setup vente", message='{"event":"SWEEP_HIGH","symbol":"{{ticker}}","price":{{close}},"timestamp":"{{timenow}}"}')
+alertcondition(sweep_low_detected,  title="⚡ SWEEP LOW — Setup achat",  message='{"event":"SWEEP_LOW","symbol":"{{ticker}}","price":{{close}},"timestamp":"{{timenow}}"}')
+alertcondition(long_signal,         title="LONG entry",                   message='{"event":"LONG","symbol":"{{ticker}}","price":{{close}},"timestamp":"{{timenow}}"}')
+alertcondition(short_signal,        title="SHORT entry",                  message='{"event":"SHORT","symbol":"{{ticker}}","price":{{close}},"timestamp":"{{timenow}}"}')
+
+// ============================================================
+// SECTION 11 — TABLEAU STATS
+// ============================================================
+
+var table stats = table.new(position.top_right, 2, 19, bgcolor=color.new(color.black, 30), border_width=1, border_color=color.gray)
+
+f_color_wr(wr) =>
+    wr >= 55 ? color.green : wr >= 45 ? color.orange : color.red
+
+f_color_pf(pf) =>
+    pf >= 1.5 ? color.green : pf >= 1.0 ? color.orange : color.red
+
+f_color_dd(dd) =>
+    dd <= 12 ? color.green : dd <= 20 ? color.orange : color.red
+
+if show_table and barstate.islast
+    // Compteurs zones
+    n_active_h = 0
+    n_active_l = 0
+    n_hq_h = 0
+    n_hq_l = 0
+    for i = 0 to 9
+        if not na(array.get(swing_highs, i))
+            n_active_h += 1
+            if array.get(sh_touches, i) >= 3
+                n_hq_h += 1
+        if not na(array.get(swing_lows, i))
+            n_active_l += 1
+            if array.get(sl_touches, i) >= 3
+                n_hq_l += 1
+    n_zones = n_active_h + n_active_l
+    n_hq = n_hq_h + n_hq_l
+
+    // Stats backtest
+    total_trades = strategy.closedtrades
+    wins = strategy.wintrades
+    losses = strategy.losstrades
+    wr = total_trades > 0 ? (wins / total_trades) * 100 : 0.0
+    pf = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : 0.0
+    avg_win = wins > 0 ? strategy.grossprofit / wins : 0.0
+    avg_loss = losses > 0 ? strategy.grossloss / losses : 0.0
+    avg_rr = avg_loss > 0 ? avg_win / avg_loss : 0.0
+    ev_pct = total_trades > 0 ? (strategy.netprofit / strategy.initial_capital) / total_trades * 100 : 0.0
+    dd_pct = strategy.max_drawdown / strategy.initial_capital * 100
+
+    bias_ema = close > ema_1h ? "BULL" : "BEAR"
+
+    table.cell(stats, 0, 0,  "LIQUIDITY HUNTER v1", bgcolor=color.new(color.blue, 30), text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 0,  syminfo.ticker,        bgcolor=color.new(color.blue, 30), text_color=color.white, text_size=size.small)
+
+    table.cell(stats, 0, 1,  "Trades total",    text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 1,  str.tostring(total_trades), text_color=color.white, text_size=size.small)
+
+    table.cell(stats, 0, 2,  "Winrate",         text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 2,  str.format("{0,number,#.#}%", wr), text_color=f_color_wr(wr), text_size=size.small)
+
+    table.cell(stats, 0, 3,  "Profit Factor",   text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 3,  str.format("{0,number,#.##}", pf), text_color=f_color_pf(pf), text_size=size.small)
+
+    table.cell(stats, 0, 4,  "RR moyen realise", text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 4,  "1:" + str.format("{0,number,#.#}", avg_rr), text_color=color.white, text_size=size.small)
+
+    table.cell(stats, 0, 5,  "EV / trade",      text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 5,  str.format("{0,number,+#.##;-#.##}%", ev_pct), text_color=ev_pct >= 0 ? color.green : color.red, text_size=size.small)
+
+    table.cell(stats, 0, 6,  "Net PnL",         text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 6,  str.format("{0,number,+#.##;-#.##}$", strategy.netprofit), text_color=strategy.netprofit >= 0 ? color.green : color.red, text_size=size.small)
+
+    table.cell(stats, 0, 7,  "Max Drawdown",    text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 7,  str.format("{0,number,#.#}%", dd_pct), text_color=f_color_dd(dd_pct), text_size=size.small)
+
+    table.cell(stats, 0, 8,  "─────",           text_color=color.gray, text_size=size.small)
+    table.cell(stats, 1, 8,  "─────",           text_color=color.gray, text_size=size.small)
+
+    table.cell(stats, 0, 9,  "Zones actives",   text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 9,  str.tostring(n_zones), text_color=color.white, text_size=size.small)
+
+    table.cell(stats, 0, 10, "Haute qualite 3+", text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 10, str.tostring(n_hq), text_color=color.yellow, text_size=size.small)
+
+    table.cell(stats, 0, 11, "Trades aujourd'hui", text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 11, str.tostring(trades_today) + "/" + str.tostring(max_trades_day), text_color=trades_today >= max_trades_day ? color.red : color.white, text_size=size.small)
+
+    table.cell(stats, 0, 12, "Pertes consec.",  text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 12, str.tostring(consec_losses) + "/" + str.tostring(max_consec_loss), text_color=consec_losses >= max_consec_loss ? color.red : color.white, text_size=size.small)
+
+    table.cell(stats, 0, 13, "─────",           text_color=color.gray, text_size=size.small)
+    table.cell(stats, 1, 13, "─────",           text_color=color.gray, text_size=size.small)
+
+    table.cell(stats, 0, 14, "Session",         text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 14, f_in_session() ? "ON" : "OFF", text_color=f_in_session() ? color.green : color.red, text_size=size.small)
+
+    table.cell(stats, 0, 15, "News block",      text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 15, f_news_blocked() ? "ON" : "OFF", text_color=f_news_blocked() ? color.red : color.green, text_size=size.small)
+
+    table.cell(stats, 0, 16, "EMA 1H bias",     text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 16, bias_ema, text_color=bias_ema == "BULL" ? color.green : color.red, text_size=size.small)
+
+    table.cell(stats, 0, 17, "Position",        text_color=color.white, text_size=size.small)
+    pos_txt = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+    table.cell(stats, 1, 17, pos_txt, text_color=strategy.position_size != 0 ? color.yellow : color.gray, text_size=size.small)
+
+    table.cell(stats, 0, 18, "Double-sweep cd", text_color=color.white, text_size=size.small)
+    cd_remain = math.max(0, double_sweep_cooldown - (bar_index - last_failed_sweep_bar))
+    table.cell(stats, 1, 18, str.tostring(cd_remain) + "b", text_color=cd_remain > 0 ? color.orange : color.green, text_size=size.small)
+
+// ============================================================
+// SECTION 12 — PLOT EMA 1H
+// ============================================================
+
+plot(use_ema_filter ? ema_1h : na, title="EMA 50 1H", color=color.orange, linewidth=2)

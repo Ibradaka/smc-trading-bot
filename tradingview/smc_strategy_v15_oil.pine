@@ -1073,7 +1073,7 @@ if show_dashboard
         diag_rr_long_ok    += (rr_long_real  >= min_rr) ? 1 : 0
         diag_rr_short_ok   += (rr_short_real >= min_rr) ? 1 : 0
 
-    txt = "SMC v13 GOLD\n" +
+    txt = "SMC v15 OIL\n" +
           "────────────\n" +
           "Trades : " + str.tostring(total)                        + "\n" +
           "WR     : " + str.tostring(math.round(wr,   1)) + "%"   + "\n" +
