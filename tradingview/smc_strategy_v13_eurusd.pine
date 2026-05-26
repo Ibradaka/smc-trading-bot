@@ -1,0 +1,1063 @@
+// ============================================================
+// SMC Strategy v13 EURUSD — V13 + Trailing ATR (forex edition)
+// Projet   : SMC Trading Bot
+// Version  : 13.0.0-EURUSD
+// Auteur   : Ibradaka
+// Date     : 2026-05-19
+//
+// CHANGELOG v13 EURUSD (re-calibrage forex depuis v13 GOLD) :
+//   * pip              : 0.1   -> 0.0001  (1 pip EURUSD hardcode)
+//   * sl_min_pips      : 50    -> 8       (8 pips forex)
+//   * sl_max_pips      : 500   -> 35      (35 pips forex)
+//   * eq_pip_tol       : 30.0  -> 3.0     (3 pips tolerance EQ)
+//   * qty clamps       : 1-50  -> 1000-500000 (unites forex)
+//   * margin_long/short: 5.0   -> 2.0     (50:1 leverage forex)
+//   * initial_capital  : 10000 -> 5000
+//   * default_qty_value: 1     -> 1000
+//   * slippage         : 5     -> 2
+//   * disp_atr_mult    : 1.0   -> 1.3     (defaut forex)
+//   * fvg_atr_mult     : 0.9   -> 1.2     (defaut forex)
+//   * min_rr conserve a 1.5 (a tester aussi a 2.0 sur EURUSD)
+//
+// CHANGELOG v13 (Trailing ATR) :
+//   * Apres BE+1R : annule l'exit fixe, place un exit trailing pur (stop = close +/- 1.5xATR)
+//   * Struct exit desactive apres BE quand trailing actif (sinon ils se concurrencent)
+//
+// CHANGELOG v10.2 GOLD (calibrage XAUUSD) :
+//   * sl_min_pips      : 8    -> 100  (=  10$ sur gold avec pip=0.1$)
+//   * sl_max_pips      : 35   -> 350  (=  35$ sur gold)
+//   * eq_pip_tol       : 3.0  -> 30.0 (=   3$ tolerance EQ)
+//   * qty clamps       : 1000-500000  -> 1-50 (oz)
+//   * margin_long/short: 2.0  -> 5.0  (20:1 leverage prudent pour gold)
+//   * initial_capital  : 5000 -> 10000 (gold = position size plus elevee)
+//   * Title strategy   : "SMC v10.2 GOLD"
+//
+// HOTFIX v10.2 GOLD v2 (apres 0 trade observed) :
+//   * use_dxy_filter   : true -> FALSE  (TVC:DXY parfois inaccessible -> bloquait tous longs)
+//   * use_strict_longs : true -> FALSE  (3/3 trop rare sur gold 15M, 2/3 suffit)
+//   * disp_atr_mult    : 1.3  -> 1.0    (gold 15M range moyen < 1.3xATR)
+//   * fvg_atr_mult     : 1.2  -> 0.9    (FVG gold plus petites en relatif)
+//
+// HOTFIX v10.2 GOLD v3 (toujours 0 trade apres v2) :
+//   * pip              : hardcode 0.1 (au lieu de syminfo.mintick * 10)
+//     Le mintick varie selon broker (OANDA=0.01, autres=0.001 ou 0.1)
+//     -> sl_long_pips devenait absurde -> sl_long_valid toujours FALSE
+//   * sl_min_pips      : 100  -> 50  (5$ min, plus permissif pour sweeps proches)
+//   * sl_max_pips      : 350  -> 500 (50$ max, accommode les SL larges)
+//   * Dashboard diagnostic : compteur de filtres bloquants
+//
+// UPDATE v10.2 GOLD v3.2 (DXY filter REDESACTIVE apres test v3.1) :
+//   * use_dxy_filter : true -> FALSE (revert)
+//   * Test v3.1 a coupe 10 longs dont 5 gagnants
+//   * WR longs 43.48% -> 38.46% (degradation -5 pts)
+//   * Net -236$ vs v3 (perte de 44% du net)
+//   * CAGR 11.90% -> 6.55%
+//   * Conclusion : correlation gold/DXY pas assez tight sur H4 pour filtre binaire
+//
+// CHANGELOG v10.2 :
+//   * Anti-contre-tendance LONGS : 3 nouveaux filtres dedies aux longs
+//     - use_h4_align_longs : exige EMA50 H4 > EMA200 H4 (longs only)
+//     - use_strict_longs   : exige 3/3 confirmations (FVG + OB + Liquidite)
+//     - use_dxy_filter     : exige DXY < EMA50 H4 (USD faible, longs only)
+//   * Objectif : passer WR longs 30% -> >40% en reduisant volume 23 -> 5-8 trades
+//   * Shorts inchanges (deja excellents : 7 trades, WR 57%, PF 2.4)
+//
+// CHANGELOG v10.1 :
+//   * Fix bug : break mal indenté dans la detection FVG bear (ligne 477)
+//   * Fix bug : break mal indenté dans la detection OB bear (ligne 574)
+//   * Ajout ASR comme source de liquidite (near_asr_h / near_asr_l)
+//   * Symetrie longs/shorts : liq_bull aligne sur liq_bear (sweep + EQ + PDH/PDL + ASR)
+//   * Reactivation des longs (use_longs = true) avec filtre directionnel
+//   * Ajout filtre "not short_confirmed" sur enter_long (symetrique aux shorts)
+// ============================================================
+// Version  : 10.0.0
+// Auteur   : Ibradaka
+// Date     : 2026-05-17
+// ============================================================
+//
+// NOUVEAUTÉS vs V9 :
+//   + HTF H4    — BOS H4 obligatoire + alignement EMA50/200 H4
+//   + Sessions  — London open 07-09h / NY open 12-14h (vs session complète)
+//   + Displacement — bougie impulsion forte dans les 3 dernières bougies
+//   + Volume spike — optionnel (tick vol FOREX = proxy)
+//
+// ARCHITECTURE :
+//   1. Liquidité       — EQH/EQL, Sweep H/L, PDH/PDL, ASR
+//   2. Structure 15M   — BOS+/-, CHoCH
+//   3. HTF H4          — BOS H4 + EMA50/200 alignement
+//   4. Zones réaction  — FVG, Order Block
+//   5. Sessions        — London open / NY open (configurables)
+//   6. Confirmations   — BOS/CHoCH + 2 parmi 3 (FVG/OB/Liq)
+//   7. Impulsion       — displacement candle + volume spike
+//   8. Risque          — $25/trade, RR≥2, SL validé
+//   9. Gestion pos.    — BE, partial TP, struct exit
+//  10. Dashboard       — stats live + état HTF
+// ============================================================
+
+//@version=6
+strategy(
+    title                   = "SMC Strategy v13 EURUSD — Trailing ATR",
+    shorttitle              = "v13 EURUSD",
+    overlay                 = true,
+    initial_capital         = 5000,
+    default_qty_type        = strategy.fixed,
+    default_qty_value       = 1000,
+    commission_type         = strategy.commission.cash_per_order,
+    commission_value        = 0.70,
+    slippage                = 2,
+    process_orders_on_close = true,
+    max_bars_back           = 500,
+    pyramiding              = 0,
+    margin_long             = 2.0,
+    margin_short            = 2.0
+)
+
+// ============================================================
+// SECTION 1 — PARAMÈTRES CONFIGURABLES
+// ============================================================
+
+var string GRP_RISK    = "Risque & Capital"
+var string GRP_LIQ     = "Liquidite"
+var string GRP_STRUCT  = "Structure de marche (15M)"
+var string GRP_FVG     = "Fair Value Gap"
+var string GRP_OB      = "Order Block"
+var string GRP_HTF     = "Filtre HTF (H4)"
+var string GRP_SESSION = "Sessions"
+var string GRP_IMPULSE = "Confirmation impulsion"
+var string GRP_FILTER  = "Filtres standard"
+var string GRP_MGMT    = "Gestion de position"
+var string GRP_DISP    = "Affichage"
+
+// --- Risque (EURUSD : 1 pip = 0.0001 hardcode) ---
+risk_usd   = input.float(25.0, "Risque par trade (USD)", minval=5,  maxval=500, step=5,   group=GRP_RISK)
+min_rr     = input.float(1.5,  "RR minimum",             minval=1.0, maxval=6.0, step=0.1, group=GRP_RISK,
+     tooltip="EURUSD : 1.5 conserve depuis v13 gold. A tester aussi a 2.0 (defaut historique EURUSD).")
+sl_min_pips= input.int(8,      "SL minimum (pips)",      minval=3,  maxval=50,             group=GRP_RISK,
+     tooltip="EURUSD : 1 pip = 0.0001 HARDCODE. 8 pips min. SL plus serre = signal rejete.")
+sl_max_pips= input.int(35,     "SL maximum (pips)",      minval=10, maxval=150,            group=GRP_RISK,
+     tooltip="EURUSD : 35 pips max. SL plus large = signal rejete (risque trop grand).")
+use_longs  = input.bool(true,  "Activer les longs",      group=GRP_RISK,
+     tooltip="Reactive en v10.1 — bugs FVG/OB bear corriges + ASR liquidite + symetrie liq_bull/liq_bear + filtre directionnel (not short_confirmed)")
+use_shorts = input.bool(true,  "Activer les shorts",     group=GRP_RISK)
+
+// --- Liquidité ---
+eq_lookback   = input.int(20,   "Lookback EQH/EQL",      minval=5,  maxval=100,            group=GRP_LIQ)
+eq_pip_tol    = input.float(3.0,"Tolerance EQH/EQL (pips)",minval=0.5,maxval=10.0,step=0.5,group=GRP_LIQ,
+     tooltip="EURUSD : 3 pips tolerance pour matcher 2 highs/lows comme EQH/EQL.")
+sweep_lookback= input.int(30,   "Lookback sweep",         minval=5,  maxval=80,             group=GRP_LIQ)
+show_eqh_eql  = input.bool(true,"Afficher EQH / EQL",                                      group=GRP_LIQ)
+show_sweeps   = input.bool(true,"Afficher sweeps",                                          group=GRP_LIQ)
+show_pdhl     = input.bool(true,"Afficher PDH / PDL",                                      group=GRP_LIQ)
+show_asr      = input.bool(true,"Afficher Asian Range",                                     group=GRP_LIQ)
+
+// --- Structure 15M ---
+struct_lookback= input.int(15, "Lookback BOS/CHoCH",     minval=5,  maxval=50,             group=GRP_STRUCT)
+swing_lookback = input.int(10, "Lookback pivot swing",   minval=3,  maxval=30,             group=GRP_STRUCT)
+show_bos       = input.bool(true,"Afficher BOS",                                           group=GRP_STRUCT)
+show_choch     = input.bool(true,"Afficher CHoCH",                                         group=GRP_STRUCT)
+
+// --- FVG ---
+fvg_atr_mult  = input.float(1.2,"Impulsion FVG min (xATR)",minval=0.3,maxval=5.0,step=0.1,group=GRP_FVG,
+     tooltip="EURUSD : 1.2 — defaut forex.")
+fvg_max_slots = input.int(3,    "Slots FVG actifs",       minval=1,  maxval=5,             group=GRP_FVG)
+show_fvg      = input.bool(true,"Afficher FVG",                                            group=GRP_FVG)
+
+// --- Order Block ---
+ob_lookback  = input.int(15,   "Lookback OB",            minval=3,  maxval=40,            group=GRP_OB)
+ob_atr_mult  = input.float(0.4,"Corps OB min (xATR)",    minval=0.1,maxval=2.0,step=0.1, group=GRP_OB)
+ob_max_slots = input.int(2,    "Slots OB actifs",        minval=1,  maxval=4,             group=GRP_OB)
+show_ob      = input.bool(true,"Afficher OB",                                             group=GRP_OB)
+
+// --- HTF (H4) ---
+use_h4_bos   = input.bool(true, "BOS H4 obligatoire",    group=GRP_HTF,
+     tooltip="Exige un BOS H4 dans la direction du trade. Se reset sur BOS inverse.")
+use_h4_align = input.bool(false, "Alignement EMA50/200 H4 (trend strength)", group=GRP_HTF,
+     tooltip="Short : EMA50 H4 < EMA200 H4. Long : EMA50 H4 > EMA200 H4.")
+use_h4_align_longs = input.bool(true, "H4 EMA50>EMA200 obligatoire (longs only)", group=GRP_HTF,
+     tooltip="V10.2 anti-contre-tendance — exige EMA50 H4 > EMA200 H4 UNIQUEMENT pour les longs. Shorts non concernes.")
+h4_bos_lb    = input.int(10,   "Lookback BOS H4 (bars H4)",minval=3,maxval=30,           group=GRP_HTF)
+show_h4_ema  = input.bool(true,"Afficher EMA50 H4",                                      group=GRP_HTF)
+
+// --- Sessions ---
+use_session  = input.bool(true, "Filtre session actif",                                   group=GRP_SESSION)
+sess_lo_open = input.bool(true, "London open  07:00-10:00 UTC",                          group=GRP_SESSION)
+sess_ny_open = input.bool(true, "NY open      12:00-15:00 UTC",                          group=GRP_SESSION)
+sess_lo_full = input.bool(true, "London full  07:00-12:00 UTC",                          group=GRP_SESSION)
+sess_ny_full = input.bool(true, "NY full      12:00-17:00 UTC",                          group=GRP_SESSION)
+
+// --- Impulsion ---
+use_displacement = input.bool(true,  "Displacement candle (3 dernières bougies)", group=GRP_IMPULSE,
+     tooltip="Au moins 1 des 3 dernières bougies doit etre une grande bougie d'impulsion directionnelle")
+disp_body_pct    = input.float(0.60, "Corps minimum (% range)", minval=0.40,maxval=0.85,step=0.05, group=GRP_IMPULSE)
+disp_atr_mult    = input.float(1.3,  "Range minimum (x ATR14)", minval=0.5, maxval=3.0, step=0.1,  group=GRP_IMPULSE,
+     tooltip="EURUSD : 1.3 — defaut forex.")
+use_volume_filter= input.bool(false, "Volume spike (tick vol — optionnel)", group=GRP_IMPULSE,
+     tooltip="Tick volume FOREX = proxy du volume reel. Desactive par defaut.")
+vol_spike_mult   = input.float(1.2,  "Volume spike (x moyenne 20)", minval=1.0,maxval=3.0,step=0.1,group=GRP_IMPULSE)
+
+// --- Filtres standard ---
+use_ema_filter= input.bool(true, "EMA 200 H4 (close < EMA200 pour short)",              group=GRP_FILTER)
+ema_len_htf   = input.int(200,   "Longueur EMA HTF",       minval=20, maxval=500,        group=GRP_FILTER)
+use_atr_filter= input.bool(true, "Filtre ATR volatilite",                               group=GRP_FILTER)
+atr_pct       = input.float(0.75,"ATR seuil (x moy 50)",   minval=0.3,maxval=1.5,step=0.05,group=GRP_FILTER)
+use_candle_cf = input.bool(false,"Confirmation bougie entree (corps>50%)",              group=GRP_FILTER)
+use_discount  = input.bool(false,"Filtre discount/premium",                             group=GRP_FILTER)
+use_strict_longs = input.bool(false,"3/3 confirmations obligatoires (longs only)", group=GRP_FILTER,
+     tooltip="GOLD : desactive par defaut — 3/3 trop rare sur gold 15M. Activer si tu veux des setups premium ultra-selectifs.")
+use_dxy_filter   = input.bool(false,"DXY < EMA50 H4 obligatoire (longs only)",     group=GRP_FILTER,
+     tooltip="GOLD v3.2 : REDESACTIVE apres test v3.1 — le filtre coupait 10 trades dont 5 gagnants, WR longs 43%->38%, net -236$. Correlation gold/DXY pas assez tight sur H4 pour un filtre binaire.")
+
+// --- Gestion de position ---
+use_breakeven  = input.bool(true, "Break-even a +1R",                                   group=GRP_MGMT)
+use_partial_tp = input.bool(true, "TP partiel 50% a +1.5R",                             group=GRP_MGMT)
+use_struct_exit= input.bool(true, "Exit sur rupture structure (10 bougies)",            group=GRP_MGMT)
+use_trail_atr  = input.bool(true, "Trailing ATR apres BE (v13)",                        group=GRP_MGMT,
+     tooltip="V13 GOLD : apres BE+1R atteint, le stop suit close +/- trail_atr_mult x ATR14. Capture les gros mouvements gold.")
+trail_atr_mult = input.float(1.5, "Trail ATR multiplier",  minval=0.5, maxval=4.0, step=0.1, group=GRP_MGMT,
+     tooltip="1.5 x ATR14 par defaut. Augmenter (2.0+) = trail plus large = moins de sorties prematurees. Reduire (1.0) = trail plus serre = capture moins de fluctuations.")
+
+// --- Affichage ---
+show_dashboard     = input.bool(true,  "Dashboard statistiques",                         group=GRP_DISP)
+show_discount_zone = input.bool(false, "Zones premium/discount",                         group=GRP_DISP)
+
+// ============================================================
+// SECTION 2 — UTILITAIRES DE BASE
+// ============================================================
+
+// EURUSD : pip hardcode a 0.0001 (broker-independant, evite le bug mintick)
+pip       = 0.0001
+atr14     = ta.atr(14)
+atr50_avg = ta.sma(atr14, 50)
+
+// ATR filter
+atr_ok = not use_atr_filter or (atr14 >= atr_pct * atr50_avg)
+
+// Volume filter (tick volume)
+vol_avg_20 = ta.sma(volume, 20)
+vol_ok     = not use_volume_filter or (volume > vol_spike_mult * vol_avg_20)
+
+// Confirmation bougie entrée (corps > 50% range)
+bull_candle     = close > open and (close - open) > 0.5 * (high - low)
+bear_candle     = close < open and (open - close) > 0.5 * (high - low)
+candle_ok_long  = not use_candle_cf or bull_candle
+candle_ok_short = not use_candle_cf or bear_candle
+
+// Displacement candle — vérification directe sur 3 bougies (indices constants, pas de variable)
+bull_disp_0 = close    > open    and (close    - open   ) > disp_body_pct * (high    - low   ) and (high    - low   ) > disp_atr_mult * atr14
+bull_disp_1 = close[1] > open[1] and (close[1] - open[1]) > disp_body_pct * (high[1] - low[1]) and (high[1] - low[1]) > disp_atr_mult * atr14[1]
+bull_disp_2 = close[2] > open[2] and (close[2] - open[2]) > disp_body_pct * (high[2] - low[2]) and (high[2] - low[2]) > disp_atr_mult * atr14[2]
+
+bear_disp_0 = close    < open    and (open    - close   ) > disp_body_pct * (high    - low   ) and (high    - low   ) > disp_atr_mult * atr14
+bear_disp_1 = close[1] < open[1] and (open[1] - close[1]) > disp_body_pct * (high[1] - low[1]) and (high[1] - low[1]) > disp_atr_mult * atr14[1]
+bear_disp_2 = close[2] < open[2] and (open[2] - close[2]) > disp_body_pct * (high[2] - low[2]) and (high[2] - low[2]) > disp_atr_mult * atr14[2]
+
+recent_bull_disp = bull_disp_0 or bull_disp_1 or bull_disp_2
+recent_bear_disp = bear_disp_0 or bear_disp_1 or bear_disp_2
+
+disp_ok_long  = not use_displacement or recent_bull_disp
+disp_ok_short = not use_displacement or recent_bear_disp
+
+// ============================================================
+// SECTION 3 — FILTRE HTF (H4)
+// ============================================================
+
+// EMA 200 H4 — filtre directionnel principal
+h4_ema200 = request.security(syminfo.tickerid, "240", ta.ema(close, ema_len_htf), lookahead=barmerge.lookahead_off)
+// EMA 50 H4 — trend strength (doit être < EMA200 pour les shorts)
+h4_ema50  = request.security(syminfo.tickerid, "240", ta.ema(close, 50),          lookahead=barmerge.lookahead_off)
+
+// H4 BOS : franchissement du range des N dernières bougies H4 confirmées
+h4_close    = request.security(syminfo.tickerid, "240", close,                              lookahead=barmerge.lookahead_off)
+h4_prev_c   = request.security(syminfo.tickerid, "240", close[1],                          lookahead=barmerge.lookahead_off)
+h4_struct_l = request.security(syminfo.tickerid, "240", ta.lowest( low[1],  h4_bos_lb),   lookahead=barmerge.lookahead_off)
+h4_struct_h = request.security(syminfo.tickerid, "240", ta.highest(high[1], h4_bos_lb),   lookahead=barmerge.lookahead_off)
+
+// Cross détecté sur les deux dernières bougies H4 fermées
+h4_bos_bear_now = h4_close < h4_struct_l and h4_prev_c >= h4_struct_l
+h4_bos_bull_now = h4_close > h4_struct_h and h4_prev_c <= h4_struct_h
+
+// Suivi de la tendance H4 (état persistant jusqu'au BOS inverse)
+var bool h4_trend_bear = false
+var bool h4_trend_bull = false
+
+if h4_bos_bear_now
+    h4_trend_bear := true
+    h4_trend_bull := false
+if h4_bos_bull_now
+    h4_trend_bull := true
+    h4_trend_bear := false
+
+// Filtres HTF pour les entrées
+ema_htf       = h4_ema200
+ema_bull       = not use_ema_filter or (close > h4_ema200)
+ema_bear       = not use_ema_filter or (close < h4_ema200)
+h4_bos_ok_bear = not use_h4_bos   or h4_trend_bear
+h4_bos_ok_bull = not use_h4_bos   or h4_trend_bull
+h4_align_bear  = not use_h4_align or (h4_ema50 < h4_ema200)
+// v10.2 : h4_align_bull active si use_h4_align OU use_h4_align_longs
+h4_align_bull  = (not use_h4_align and not use_h4_align_longs) or (h4_ema50 > h4_ema200)
+
+// v10.2 — DXY filter (longs only)
+dxy_close_h4 = request.security("TVC:DXY", "240", close,                     lookahead=barmerge.lookahead_off)
+dxy_ema50_h4 = request.security("TVC:DXY", "240", ta.ema(close, 50),         lookahead=barmerge.lookahead_off)
+dxy_ok_long  = not use_dxy_filter or (dxy_close_h4 < dxy_ema50_h4)
+
+// ============================================================
+// SECTION 4 — SESSIONS
+// ============================================================
+
+// Opens (haute volatilité) — défaut v10
+in_lo_open = not na(time(timeframe.period, "0700-1000", "UTC"))
+in_ny_open = not na(time(timeframe.period, "1200-1500", "UTC"))
+
+// Sessions complètes (option élargie)
+in_lo_full = not na(time(timeframe.period, "0700-1200", "UTC"))
+in_ny_full = not na(time(timeframe.period, "1200-1700", "UTC"))
+
+in_london  = (sess_lo_open and in_lo_open) or (sess_lo_full and in_lo_full)
+in_ny      = (sess_ny_open and in_ny_open) or (sess_ny_full and in_ny_full)
+in_session = not use_session or in_london or in_ny
+
+// Session London brute (pour reset ASR — indépendant des paramètres utilisateur)
+in_lo_raw         = not na(time(timeframe.period, "0700-1200", "UTC"))
+is_london_open_bar = in_lo_raw and not in_lo_raw[1]
+
+// ============================================================
+// SECTION 5 — NIVEAUX INSTITUTIONNELS (PDH/PDL, ASR)
+// ============================================================
+
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_off)
+
+var float asr_high = na
+var float asr_low  = na
+
+is_asian = not na(time(timeframe.period, "0000-0700", "UTC"))
+
+if is_asian
+    asr_high := na(asr_high) ? high : math.max(asr_high, high)
+    asr_low  := na(asr_low)  ? low  : math.min(asr_low,  low)
+
+if is_london_open_bar
+    asr_high := na
+    asr_low  := na
+
+if show_pdhl and barstate.islast
+    line.new(bar_index - 40, pdh, bar_index, pdh, color=color.new(color.orange, 20), width=1, style=line.style_dashed)
+    line.new(bar_index - 40, pdl, bar_index, pdl, color=color.new(color.orange, 20), width=1, style=line.style_dashed)
+    label.new(bar_index, pdh, "PDH", color=color.new(color.orange, 30), textcolor=color.white, size=size.tiny, style=label.style_label_left)
+    label.new(bar_index, pdl, "PDL", color=color.new(color.orange, 30), textcolor=color.white, size=size.tiny, style=label.style_label_left)
+
+if show_asr and not na(asr_high) and barstate.islast
+    line.new(bar_index - 30, asr_high, bar_index, asr_high, color=color.new(color.purple, 30), width=1, style=line.style_dotted)
+    line.new(bar_index - 30, asr_low,  bar_index, asr_low,  color=color.new(color.purple, 30), width=1, style=line.style_dotted)
+    label.new(bar_index, asr_high, "ASR H", color=color.new(color.purple, 40), textcolor=color.white, size=size.tiny, style=label.style_label_left)
+    label.new(bar_index, asr_low,  "ASR L", color=color.new(color.purple, 40), textcolor=color.white, size=size.tiny, style=label.style_label_left)
+
+// ============================================================
+// SECTION 6 — EQH / EQL
+// ============================================================
+
+tol_price = eq_pip_tol * pip
+
+var float eqh_level = na
+var float eql_level = na
+var bool  eqh_found = false
+var bool  eql_found = false
+var bool  eqh_prev  = false
+var bool  eql_prev  = false
+
+eqh_prev  := eqh_found
+eql_prev  := eql_found
+eqh_found := false
+eql_found := false
+
+for i = 1 to eq_lookback - 1
+    for j = i + 1 to eq_lookback
+        if j > eq_lookback
+            break
+        if math.abs(high[i] - high[j]) <= tol_price
+            if not eqh_found or high[i] > eqh_level
+                eqh_found := true
+                eqh_level := high[i]
+        if math.abs(low[i] - low[j]) <= tol_price
+            if not eql_found or low[i] < eql_level
+                eql_found := true
+                eql_level := low[i]
+
+if show_eqh_eql and barstate.isconfirmed
+    if eqh_found and not eqh_prev
+        line.new(bar_index - eq_lookback, eqh_level, bar_index, eqh_level,
+                 color=color.new(color.red, 20), width=2, style=line.style_dashed)
+        label.new(bar_index, eqh_level, "EQH", color=color.new(color.red, 20),
+                  textcolor=color.white, size=size.tiny, style=label.style_label_down)
+    if eql_found and not eql_prev
+        line.new(bar_index - eq_lookback, eql_level, bar_index, eql_level,
+                 color=color.new(color.green, 20), width=2, style=line.style_dashed)
+        label.new(bar_index, eql_level, "EQL", color=color.new(color.green, 20),
+                  textcolor=color.white, size=size.tiny, style=label.style_label_up)
+
+// ============================================================
+// SECTION 7 — SWEEP DE LIQUIDITÉ
+// ============================================================
+
+recent_high_sw = ta.highest(high, sweep_lookback)[1]
+recent_low_sw  = ta.lowest(low,   sweep_lookback)[1]
+
+sweep_high_raw = high > recent_high_sw and close < recent_high_sw
+sweep_low_raw  = low  < recent_low_sw  and close > recent_low_sw
+
+sweep_high = sweep_high_raw and barstate.isconfirmed
+sweep_low  = sweep_low_raw  and barstate.isconfirmed
+
+var float last_sweep_h_px  = na
+var float last_sweep_l_px  = na
+var int   last_sweep_h_bar = na
+var int   last_sweep_l_bar = na
+
+if sweep_high
+    last_sweep_h_px  := recent_high_sw
+    last_sweep_h_bar := bar_index
+    if show_sweeps
+        label.new(bar_index, high, "SWEEP H", color=color.new(color.red, 10),
+                  textcolor=color.white, size=size.tiny, style=label.style_label_down)
+
+if sweep_low
+    last_sweep_l_px  := recent_low_sw
+    last_sweep_l_bar := bar_index
+    if show_sweeps
+        label.new(bar_index, low, "SWEEP L", color=color.new(color.green, 10),
+                  textcolor=color.white, size=size.tiny, style=label.style_label_up)
+
+// ============================================================
+// SECTION 8 — STRUCTURE DE MARCHÉ 15M (BOS / CHoCH)
+// ============================================================
+
+swing_h = ta.pivothigh(high, swing_lookback, swing_lookback)
+swing_l  = ta.pivotlow(low,  swing_lookback, swing_lookback)
+
+var float last_sh = na
+var float last_sl = na
+
+if not na(swing_h)
+    last_sh := swing_h
+if not na(swing_l)
+    last_sl := swing_l
+
+bos_bull = not na(last_sh) and close > last_sh and close[1] <= last_sh[1] and barstate.isconfirmed
+bos_bear = not na(last_sl) and close < last_sl and close[1] >= last_sl[1] and barstate.isconfirmed
+
+var bool trend_bull = false
+var bool trend_bear = false
+
+choch_bull = bos_bull and trend_bear
+choch_bear = bos_bear and trend_bull
+
+if bos_bull
+    trend_bull := true
+    trend_bear := false
+if bos_bear
+    trend_bear := true
+    trend_bull := false
+
+var bool had_bos_bull   = false
+var bool had_bos_bear   = false
+var bool had_choch_bull = false
+var bool had_choch_bear = false
+var int  bos_bull_bar   = 0
+var int  bos_bear_bar   = 0
+var int  choch_bull_bar = 0
+var int  choch_bear_bar = 0
+
+if bos_bull
+    had_bos_bull  := true
+    bos_bull_bar  := bar_index
+if bos_bear
+    had_bos_bear  := true
+    bos_bear_bar  := bar_index
+if choch_bull
+    had_choch_bull := true
+    choch_bull_bar := bar_index
+if choch_bear
+    had_choch_bear := true
+    choch_bear_bar := bar_index
+
+window = struct_lookback * 2
+
+bos_bull_ok   = had_bos_bull   and (bar_index - bos_bull_bar)   < window
+bos_bear_ok   = had_bos_bear   and (bar_index - bos_bear_bar)   < window
+choch_bull_ok = had_choch_bull and (bar_index - choch_bull_bar) < window
+choch_bear_ok = had_choch_bear and (bar_index - choch_bear_bar) < window
+sweep_l_ok    = not na(last_sweep_l_bar) and (bar_index - last_sweep_l_bar) < window
+sweep_h_ok    = not na(last_sweep_h_bar) and (bar_index - last_sweep_h_bar) < window
+
+if show_bos and barstate.isconfirmed
+    if bos_bull and not na(last_sh)
+        line.new(bar_index - 1, last_sh, bar_index, last_sh, color=color.blue, width=2)
+        label.new(bar_index, last_sh, "BOS+", color=color.new(color.blue, 10),
+                  textcolor=color.white, size=size.small, style=label.style_label_down)
+    if bos_bear and not na(last_sl)
+        line.new(bar_index - 1, last_sl, bar_index, last_sl, color=color.red, width=2)
+        label.new(bar_index, last_sl, "BOS-", color=color.new(color.red, 10),
+                  textcolor=color.white, size=size.small, style=label.style_label_up)
+
+if show_choch and barstate.isconfirmed
+    if choch_bull
+        label.new(bar_index, low, "CHoCH+", color=color.new(color.lime, 10),
+                  textcolor=color.black, size=size.small, style=label.style_label_up)
+    if choch_bear
+        label.new(bar_index, high, "CHoCH-", color=color.new(color.orange, 10),
+                  textcolor=color.black, size=size.small, style=label.style_label_down)
+
+// ============================================================
+// SECTION 9 — FVG (Fair Value Gap / Imbalance)
+// ============================================================
+
+fvg_bull_raw = low > high[2] and (high[1] - low[1]) > fvg_atr_mult * atr14
+fvg_bear_raw = high < low[2] and (high[1] - low[1]) > fvg_atr_mult * atr14
+
+var float[] fvg_bull_top  = array.new_float(0)
+var float[] fvg_bull_bot  = array.new_float(0)
+var bool[]  fvg_bull_live = array.new_bool(0)
+
+var float[] fvg_bear_top  = array.new_float(0)
+var float[] fvg_bear_bot  = array.new_float(0)
+var bool[]  fvg_bear_live = array.new_bool(0)
+
+if fvg_bull_raw and barstate.isconfirmed
+    array.unshift(fvg_bull_top,  low)
+    array.unshift(fvg_bull_bot,  high[2])
+    array.unshift(fvg_bull_live, true)
+    if array.size(fvg_bull_top) > fvg_max_slots
+        array.pop(fvg_bull_top)
+        array.pop(fvg_bull_bot)
+        array.pop(fvg_bull_live)
+
+if fvg_bear_raw and barstate.isconfirmed
+    array.unshift(fvg_bear_top,  low[2])
+    array.unshift(fvg_bear_bot,  high)
+    array.unshift(fvg_bear_live, true)
+    if array.size(fvg_bear_top) > fvg_max_slots
+        array.pop(fvg_bear_top)
+        array.pop(fvg_bear_bot)
+        array.pop(fvg_bear_live)
+
+if array.size(fvg_bull_live) > 0
+    for k = 0 to array.size(fvg_bull_live) - 1
+        if array.get(fvg_bull_live, k) and close < array.get(fvg_bull_bot, k)
+            array.set(fvg_bull_live, k, false)
+
+if array.size(fvg_bear_live) > 0
+    for k = 0 to array.size(fvg_bear_live) - 1
+        if array.get(fvg_bear_live, k) and close > array.get(fvg_bear_top, k)
+            array.set(fvg_bear_live, k, false)
+
+price_in_bull_fvg = false
+if array.size(fvg_bull_live) > 0
+    for k = 0 to array.size(fvg_bull_live) - 1
+        if array.get(fvg_bull_live, k)
+            if low <= array.get(fvg_bull_top, k) and high >= array.get(fvg_bull_bot, k)
+                price_in_bull_fvg := true
+                break
+
+price_in_bear_fvg = false
+if array.size(fvg_bear_live) > 0
+    for k = 0 to array.size(fvg_bear_live) - 1
+        if array.get(fvg_bear_live, k)
+            if low <= array.get(fvg_bear_top, k) and high >= array.get(fvg_bear_bot, k)
+                price_in_bear_fvg := true
+                break
+
+if show_fvg and barstate.isconfirmed
+    if fvg_bull_raw
+        box.new(bar_index - 2, low, bar_index, high[2],
+                bgcolor=color.new(color.green, 80), border_color=color.new(color.green, 50))
+        label.new(bar_index, high[2], "IMB+", color=color.new(color.green, 30),
+                  textcolor=color.white, size=size.tiny, style=label.style_label_down)
+    if fvg_bear_raw
+        box.new(bar_index - 2, low[2], bar_index, high,
+                bgcolor=color.new(color.red, 80), border_color=color.new(color.red, 50))
+        label.new(bar_index, low[2], "IMB-", color=color.new(color.red, 30),
+                  textcolor=color.white, size=size.tiny, style=label.style_label_up)
+
+// ============================================================
+// SECTION 10 — ORDER BLOCKS
+// ============================================================
+
+bull_impulse_candle = close > open and (high - low) > ob_atr_mult * atr14
+bear_impulse_candle = close < open and (high - low) > ob_atr_mult * atr14
+
+var float[] ob_bull_top  = array.new_float(0)
+var float[] ob_bull_bot  = array.new_float(0)
+var bool[]  ob_bull_live = array.new_bool(0)
+
+var float[] ob_bear_top  = array.new_float(0)
+var float[] ob_bear_bot  = array.new_float(0)
+var bool[]  ob_bear_live = array.new_bool(0)
+
+if bull_impulse_candle and barstate.isconfirmed
+    ob_found_top = float(na)
+    ob_found_bot = float(na)
+    for i = 1 to ob_lookback
+        if close[i] < open[i] and (open[i] - close[i]) > ob_atr_mult * atr14
+            ob_found_top := open[i]
+            ob_found_bot := close[i]
+            break
+    if not na(ob_found_top)
+        array.unshift(ob_bull_top,  ob_found_top)
+        array.unshift(ob_bull_bot,  ob_found_bot)
+        array.unshift(ob_bull_live, true)
+        if array.size(ob_bull_top) > ob_max_slots
+            array.pop(ob_bull_top)
+            array.pop(ob_bull_bot)
+            array.pop(ob_bull_live)
+        if show_ob
+            box.new(bar_index - ob_lookback, ob_found_top, bar_index, ob_found_bot,
+                    bgcolor=color.new(color.aqua, 85), border_color=color.new(color.aqua, 40))
+            label.new(bar_index, ob_found_bot, "OB+", color=color.new(color.aqua, 20),
+                      textcolor=color.black, size=size.tiny, style=label.style_label_up)
+
+if bear_impulse_candle and barstate.isconfirmed
+    ob_found_top = float(na)
+    ob_found_bot = float(na)
+    for i = 1 to ob_lookback
+        if close[i] > open[i] and (close[i] - open[i]) > ob_atr_mult * atr14
+            ob_found_top := close[i]
+            ob_found_bot := open[i]
+            break
+    if not na(ob_found_top)
+        array.unshift(ob_bear_top,  ob_found_top)
+        array.unshift(ob_bear_bot,  ob_found_bot)
+        array.unshift(ob_bear_live, true)
+        if array.size(ob_bear_top) > ob_max_slots
+            array.pop(ob_bear_top)
+            array.pop(ob_bear_bot)
+            array.pop(ob_bear_live)
+        if show_ob
+            box.new(bar_index - ob_lookback, ob_found_top, bar_index, ob_found_bot,
+                    bgcolor=color.new(color.orange, 85), border_color=color.new(color.orange, 40))
+            label.new(bar_index, ob_found_top, "OB-", color=color.new(color.orange, 20),
+                      textcolor=color.white, size=size.tiny, style=label.style_label_down)
+
+if array.size(ob_bull_live) > 0
+    for k = 0 to array.size(ob_bull_live) - 1
+        if array.get(ob_bull_live, k) and close < array.get(ob_bull_bot, k)
+            array.set(ob_bull_live, k, false)
+
+if array.size(ob_bear_live) > 0
+    for k = 0 to array.size(ob_bear_live) - 1
+        if array.get(ob_bear_live, k) and close > array.get(ob_bear_top, k)
+            array.set(ob_bear_live, k, false)
+
+price_in_bull_ob = false
+if array.size(ob_bull_live) > 0
+    for k = 0 to array.size(ob_bull_live) - 1
+        if array.get(ob_bull_live, k)
+            if low <= array.get(ob_bull_top, k) and high >= array.get(ob_bull_bot, k)
+                price_in_bull_ob := true
+                break
+
+price_in_bear_ob = false
+if array.size(ob_bear_live) > 0
+    for k = 0 to array.size(ob_bear_live) - 1
+        if array.get(ob_bear_live, k)
+            if low <= array.get(ob_bear_top, k) and high >= array.get(ob_bear_bot, k)
+                price_in_bear_ob := true
+                break
+
+// ============================================================
+// SECTION 11 — ZONES PREMIUM / DISCOUNT
+// ============================================================
+
+range_h   = ta.highest(high, struct_lookback)
+range_l   = ta.lowest(low,   struct_lookback)
+range_mid = (range_h + range_l) / 2.0
+
+in_discount = close < range_mid
+in_premium  = close > range_mid
+
+discount_ok_long  = not use_discount or in_discount
+discount_ok_short = not use_discount or in_premium
+
+if show_discount_zone and barstate.islast
+    box.new(bar_index - struct_lookback, range_mid, bar_index, range_l,
+            bgcolor=color.new(color.green, 93), border_color=color.new(color.white, 100))
+    box.new(bar_index - struct_lookback, range_h,   bar_index, range_mid,
+            bgcolor=color.new(color.red,   93), border_color=color.new(color.white, 100))
+
+// ============================================================
+// SECTION 12 — LOGIQUE DES CONFIRMATIONS (2 sur 3)
+// ============================================================
+//
+// PRÉREQUIS : BOS ou CHoCH dans la bonne direction (15M)
+// CONFIRMATIONS : 2 parmi → A=Liquidité, B=FVG, C=OB
+//   A+B : FVG + Liquidité
+//   A+C : OB  + Liquidité
+//   B+C : OB  + FVG
+
+struct_bull = bos_bull_ok or choch_bull_ok
+struct_bear = bos_bear_ok or choch_bear_ok
+
+near_pdl   = not na(pdl)      and math.abs(low  - pdl)      < eq_pip_tol * pip * 3
+near_pdh   = not na(pdh)      and math.abs(high - pdh)      < eq_pip_tol * pip * 3
+near_asr_l = not na(asr_low)  and math.abs(low  - asr_low)  < eq_pip_tol * pip * 3
+near_asr_h = not na(asr_high) and math.abs(high - asr_high) < eq_pip_tol * pip * 3
+
+// Liquidite = sweep OU egalite (EQ) OU niveau journalier (PDH/PDL) OU range asiatique (ASR)
+liq_bull = sweep_l_ok or eql_found or near_pdl or near_asr_l
+liq_bear = sweep_h_ok or eqh_found or near_pdh or near_asr_h
+
+// 2 confirmations sur 3 (FVG, OB, Liquidite) — symetrique longs/shorts
+bull_ab = price_in_bull_fvg and liq_bull              // FVG + Liquidite
+bull_ac = price_in_bull_ob  and liq_bull              // OB  + Liquidite
+bull_bc = price_in_bull_ob  and price_in_bull_fvg     // OB  + FVG
+
+// v10.2 — Mode strict longs : exige 3/3 confirmations (FVG + OB + Liquidite)
+long_confirmed_2of3 = struct_bull and (bull_ab or bull_ac or bull_bc)
+long_confirmed_3of3 = struct_bull and price_in_bull_fvg and price_in_bull_ob and liq_bull
+long_confirmed = use_strict_longs ? long_confirmed_3of3 : long_confirmed_2of3
+
+bear_ab = price_in_bear_fvg and liq_bear              // FVG + Liquidite
+bear_ac = price_in_bear_ob  and liq_bear              // OB  + Liquidite
+bear_bc = price_in_bear_ob  and price_in_bear_fvg     // OB  + FVG
+
+short_confirmed = struct_bear and (bear_ab or bear_ac or bear_bc)
+
+// ============================================================
+// SECTION 13 — CALCUL SL / TP / SIZING
+// ============================================================
+
+sl_ref_long = last_sweep_l_px
+if array.size(ob_bull_live) > 0
+    for k = 0 to array.size(ob_bull_live) - 1
+        if array.get(ob_bull_live, k)
+            bot = array.get(ob_bull_bot, k)
+            if na(sl_ref_long) or bot < sl_ref_long
+                sl_ref_long := bot
+
+if na(sl_ref_long)
+    sl_ref_long := close - sl_min_pips * pip
+
+sl_long_raw  = sl_ref_long - 2.0 * pip
+sl_long_pips = (close - sl_long_raw) / pip
+
+sl_ref_short = last_sweep_h_px
+if array.size(ob_bear_live) > 0
+    for k = 0 to array.size(ob_bear_live) - 1
+        if array.get(ob_bear_live, k)
+            top = array.get(ob_bear_top, k)
+            if na(sl_ref_short) or top > sl_ref_short
+                sl_ref_short := top
+
+if na(sl_ref_short)
+    sl_ref_short := close + sl_min_pips * pip
+
+sl_short_raw  = sl_ref_short + 2.0 * pip
+sl_short_pips = (sl_short_raw - close) / pip
+
+sl_long_valid  = sl_long_pips  >= sl_min_pips and sl_long_pips  <= sl_max_pips
+sl_short_valid = sl_short_pips >= sl_min_pips and sl_short_pips <= sl_max_pips
+
+_tp_long(entry, sl) =>
+    base = entry + min_rr * (entry - sl)
+    if not na(eqh_level) and eqh_level > base
+        eqh_level
+    else if not na(pdh) and pdh > base
+        pdh
+    else
+        base
+
+_tp_short(entry, sl) =>
+    base = entry - min_rr * (sl - entry)
+    if not na(eql_level) and eql_level < base
+        eql_level
+    else if not na(pdl) and pdl < base
+        pdl
+    else
+        base
+
+tp_long_raw  = _tp_long(close, sl_long_raw)
+tp_short_raw = _tp_short(close, sl_short_raw)
+
+rr_long_real  = sl_long_pips  > 0 ? (tp_long_raw  - close)         / (close        - sl_long_raw)  : 0.0
+rr_short_real = sl_short_pips > 0 ? (close         - tp_short_raw)  / (sl_short_raw - close)        : 0.0
+
+// Sizing dynamique en unites (qty = risk_usd / sl_distance_prix)
+// EURUSD : 1000 unites = 1 micro-lot. Compte 5000$ leverage 50:1.
+sl_dist_long  = math.max(close - sl_long_raw,  sl_min_pips * pip)
+sl_dist_short = math.max(sl_short_raw - close, sl_min_pips * pip)
+qty_long  = math.max(1000.0, math.min(500000.0, math.round(risk_usd / sl_dist_long)))
+qty_short = math.max(1000.0, math.min(500000.0, math.round(risk_usd / sl_dist_short)))
+
+// ============================================================
+// SECTION 14 — CONDITIONS D'ENTRÉE FINALES
+// ============================================================
+
+no_position = strategy.position_size == 0
+
+sl_long_dir_ok  = sl_long_raw  < close - sl_min_pips * pip
+sl_short_dir_ok = sl_short_raw > close + sl_min_pips * pip
+
+enter_long = use_longs
+     and no_position
+     and barstate.isconfirmed
+     and in_session
+     and atr_ok
+     and long_confirmed              // v10.2 : 3/3 si use_strict_longs sinon 2/3
+     and not short_confirmed         // filtre clarte directionnelle (symetrique aux shorts)
+     and ema_bull
+     and h4_bos_ok_bull
+     and h4_align_bull               // v10.2 : EMA50 H4 > EMA200 H4 si use_h4_align_longs
+     and dxy_ok_long                 // v10.2 : DXY < EMA50 H4 (USD faible)
+     and disp_ok_long
+     and vol_ok
+     and candle_ok_long
+     and discount_ok_long
+     and sl_long_valid
+     and sl_long_dir_ok
+     and rr_long_real >= min_rr
+
+enter_short = use_shorts
+     and no_position
+     and barstate.isconfirmed
+     and in_session
+     and atr_ok
+     and short_confirmed
+     and not long_confirmed      // filtre clarté directionnelle
+     and ema_bear
+     and h4_bos_ok_bear
+     and h4_align_bear
+     and disp_ok_short
+     and vol_ok
+     and candle_ok_short
+     and discount_ok_short
+     and sl_short_valid
+     and sl_short_dir_ok
+     and rr_short_real >= min_rr
+
+// ============================================================
+// SECTION 15 — EXÉCUTION DES ORDRES
+// ============================================================
+
+var float entry_sl  = na
+var float entry_tp  = na
+var float entry_tp1 = na
+var bool  be_done   = false
+var bool  tp1_done  = false
+
+// v13 GOLD — tracking trailing ATR (highest/lowest stop atteint)
+var float trail_high_sl_long  = na
+var float trail_low_sl_short  = na
+var bool  trail_started       = false
+
+if enter_long
+    entry_sl  := sl_long_raw
+    entry_tp  := tp_long_raw
+    entry_tp1 := close + 1.5 * (close - sl_long_raw)
+    be_done   := false
+    tp1_done  := false
+    strategy.entry("Long", strategy.long, qty=qty_long)
+    strategy.exit("Long_exit", from_entry="Long",
+         stop    = sl_long_raw,
+         limit   = tp_long_raw,
+         comment = "TP/SL Long")
+    label.new(bar_index, low,
+              "LONG  RR:" + str.tostring(math.round(rr_long_real, 2)) +
+              "  SL:" + str.tostring(math.round(sl_long_pips, 1)) + "p",
+              color=color.new(color.green, 10), textcolor=color.white,
+              size=size.normal, style=label.style_label_up)
+
+else if enter_short
+    entry_sl  := sl_short_raw
+    entry_tp  := tp_short_raw
+    entry_tp1 := close - 1.5 * (sl_short_raw - close)
+    be_done   := false
+    tp1_done  := false
+    strategy.entry("Short", strategy.short, qty=qty_short)
+    strategy.exit("Short_exit", from_entry="Short",
+         stop    = sl_short_raw,
+         limit   = tp_short_raw,
+         comment = "TP/SL Short")
+    label.new(bar_index, high,
+              "SHORT  RR:" + str.tostring(math.round(rr_short_real, 2)) +
+              "  SL:" + str.tostring(math.round(sl_short_pips, 1)) + "p",
+              color=color.new(color.red, 10), textcolor=color.white,
+              size=size.normal, style=label.style_label_down)
+
+// ============================================================
+// SECTION 16 — GESTION DE POSITION (BE, PARTIAL TP, STRUCT EXIT)
+// ============================================================
+
+is_long_pos  = strategy.position_size > 0
+is_short_pos = strategy.position_size < 0
+avg_px       = strategy.position_avg_price
+
+if (is_long_pos or is_short_pos) and not na(entry_sl) and not na(entry_tp)
+
+    one_r = math.abs(avg_px - entry_sl)
+
+    if use_breakeven and not be_done
+        if is_long_pos  and close >= avg_px + one_r
+            be_done := true
+            strategy.exit("Long_exit", from_entry="Long",
+                 stop    = avg_px + pip,
+                 limit   = entry_tp,
+                 comment = "BE Long")
+        if is_short_pos and close <= avg_px - one_r
+            be_done := true
+            strategy.exit("Short_exit", from_entry="Short",
+                 stop    = avg_px - pip,
+                 limit   = entry_tp,
+                 comment = "BE Short")
+
+    if use_partial_tp and not tp1_done and not na(entry_tp1)
+        if is_long_pos  and close >= entry_tp1
+            tp1_done := true
+            strategy.exit("Long_tp1", from_entry="Long",
+                 qty_percent = 50,
+                 limit       = entry_tp1,
+                 comment     = "TP1 Long 50%")
+        if is_short_pos and close <= entry_tp1
+            tp1_done := true
+            strategy.exit("Short_tp1", from_entry="Short",
+                 qty_percent = 50,
+                 limit       = entry_tp1,
+                 comment     = "TP1 Short 50%")
+
+    // v13 GOLD — struct exit actif AVANT le BE, ou si trailing desactive
+    // Apres BE+trailing : le trailing ATR est le seul mecanisme de sortie
+    if use_struct_exit and not (be_done and use_trail_atr)
+        struct_l = ta.lowest(low,   10)[1]
+        struct_h = ta.highest(high, 10)[1]
+        if is_long_pos  and close < struct_l
+            strategy.close("Long",  comment="Struct exit L")
+        if is_short_pos and close > struct_h
+            strategy.close("Short", comment="Struct exit S")
+
+    // v13 GOLD — Trailing ATR (apres BE+1R atteint)
+    // FIX : on ANNULE l'exit fixe (Long_exit/Short_exit) et on place un exit
+    //       trailing pur (Long_trail/Short_trail) sans TP plafond.
+    // FIX : trail_high/low en var pour garantir que le stop ne recule jamais.
+    if use_trail_atr and be_done
+        if is_long_pos
+            new_trail_long = close - trail_atr_mult * atr14
+            if na(trail_high_sl_long) or new_trail_long > trail_high_sl_long
+                trail_high_sl_long := new_trail_long
+            if trail_high_sl_long > avg_px + pip   // jamais sous le BE+1pip
+                if not trail_started
+                    strategy.cancel("Long_exit")   // retire l'exit fixe SL+TP
+                    trail_started := true
+                strategy.exit("Long_trail", from_entry="Long",
+                     stop    = trail_high_sl_long,
+                     comment = "Trail ATR L")
+        if is_short_pos
+            new_trail_short = close + trail_atr_mult * atr14
+            if na(trail_low_sl_short) or new_trail_short < trail_low_sl_short
+                trail_low_sl_short := new_trail_short
+            if trail_low_sl_short < avg_px - pip   // jamais au-dessus du BE-1pip
+                if not trail_started
+                    strategy.cancel("Short_exit")  // retire l'exit fixe SL+TP
+                    trail_started := true
+                strategy.exit("Short_trail", from_entry="Short",
+                     stop    = trail_low_sl_short,
+                     comment = "Trail ATR S")
+
+if no_position
+    entry_sl := na
+    entry_tp := na
+    trail_high_sl_long := na
+    trail_low_sl_short := na
+    trail_started      := false
+
+// ============================================================
+// SECTION 17 — DASHBOARD STATISTIQUES
+// ============================================================
+
+if show_dashboard
+    total  = strategy.closedtrades
+    wins   = strategy.wintrades
+    losses = strategy.losstrades
+    wr     = total > 0 ? wins / total * 100.0 : 0.0
+    pf     = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : 0.0
+    net    = strategy.netprofit
+    dd     = strategy.max_drawdown
+
+    htf_state = h4_trend_bear ? "BEAR ✓" : h4_trend_bull ? "BULL" : "—"
+    h4_align  = h4_ema50 < h4_ema200 ? "EMA50<200 (bear)" : "EMA50>200 (bull)"
+    dxy_state = dxy_close_h4 < dxy_ema50_h4 ? "DXY bear (long OK)" : "DXY bull (long bloque)"
+
+    // v3 — Diagnostic : compte combien de bougies passent chaque filtre (cumul depuis debut)
+    var int diag_session = 0
+    var int diag_atr = 0
+    var int diag_long_conf = 0
+    var int diag_short_conf = 0
+    var int diag_ema_bull = 0
+    var int diag_ema_bear = 0
+    var int diag_h4_bos_bull = 0
+    var int diag_h4_bos_bear = 0
+    var int diag_sl_long_valid = 0
+    var int diag_sl_short_valid = 0
+    var int diag_rr_long_ok = 0
+    var int diag_rr_short_ok = 0
+
+    if barstate.isconfirmed
+        diag_session       += in_session       ? 1 : 0
+        diag_atr           += atr_ok           ? 1 : 0
+        diag_long_conf     += long_confirmed   ? 1 : 0
+        diag_short_conf    += short_confirmed  ? 1 : 0
+        diag_ema_bull      += ema_bull         ? 1 : 0
+        diag_ema_bear      += ema_bear         ? 1 : 0
+        diag_h4_bos_bull   += h4_bos_ok_bull   ? 1 : 0
+        diag_h4_bos_bear   += h4_bos_ok_bear   ? 1 : 0
+        diag_sl_long_valid += sl_long_valid    ? 1 : 0
+        diag_sl_short_valid+= sl_short_valid   ? 1 : 0
+        diag_rr_long_ok    += (rr_long_real  >= min_rr) ? 1 : 0
+        diag_rr_short_ok   += (rr_short_real >= min_rr) ? 1 : 0
+
+    txt = "SMC v13 EURUSD\n" +
+          "────────────\n" +
+          "Trades : " + str.tostring(total)                        + "\n" +
+          "WR     : " + str.tostring(math.round(wr,   1)) + "%"   + "\n" +
+          "Net    : " + str.tostring(math.round(net,  2)) + " $"  + "\n" +
+          "MaxDD  : " + str.tostring(math.round(dd,   2)) + " $"  + "\n" +
+          "────────────\n" +
+          "H4 BOS : " + htf_state + "\n" +
+          "H4 EMA : " + h4_align + "\n" +
+          "DXY    : " + dxy_state + "\n" +
+          "────────────\n" +
+          "DIAGNOSTIC (cumul bougies)\n" +
+          "Session     : " + str.tostring(diag_session) + "\n" +
+          "ATR ok      : " + str.tostring(diag_atr) + "\n" +
+          "Long conf   : " + str.tostring(diag_long_conf) + "\n" +
+          "Short conf  : " + str.tostring(diag_short_conf) + "\n" +
+          "EMA bull    : " + str.tostring(diag_ema_bull) + "\n" +
+          "EMA bear    : " + str.tostring(diag_ema_bear) + "\n" +
+          "H4 BOS bull : " + str.tostring(diag_h4_bos_bull) + "\n" +
+          "H4 BOS bear : " + str.tostring(diag_h4_bos_bear) + "\n" +
+          "SL Long ok  : " + str.tostring(diag_sl_long_valid) + "\n" +
+          "SL Short ok : " + str.tostring(diag_sl_short_valid) + "\n" +
+          "RR Long ok  : " + str.tostring(diag_rr_long_ok) + "\n" +
+          "RR Short ok : " + str.tostring(diag_rr_short_ok)
+
+    var table dash = table.new(position.top_right, 1, 1,
+         bgcolor      = color.new(color.black, 10),
+         border_color = color.new(color.gray,  40),
+         border_width = 1)
+    table.cell(dash, 0, 0, txt,
+         text_color = color.white,
+         text_size  = size.small,
+         bgcolor    = color.new(color.black, 15))
+
+// ============================================================
+// SECTION 18 — PLOTS & ALERTES
+// ============================================================
+
+plot(use_ema_filter ? h4_ema200 : na, "EMA 200 H4",
+     color=color.new(color.yellow, 30), linewidth=2)
+plot(show_h4_ema   ? h4_ema50   : na, "EMA 50 H4",
+     color=color.new(color.orange, 40), linewidth=1)
+plot(show_discount_zone ? range_mid : na, "Midpoint",
+     color=color.new(color.gray, 50), linewidth=1, style=plot.style_circles)
+
+alertcondition(enter_long,  title="SMC v10 LONG",  message="SMC v10 - LONG {{ticker}} {{interval}}")
+alertcondition(enter_short, title="SMC v10 SHORT", message="SMC v10 - SHORT {{ticker}} {{interval}}")

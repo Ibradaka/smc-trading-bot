@@ -1,0 +1,933 @@
+// ============================================================
+// SMC Strategy v7 — BOS (Longs) + CHoCH (Shorts) + Session 07-17h
+// Projet   : SMC Trading Bot
+// Version  : 7.0.0
+// ============================================================
+//
+// MODIFICATIONS vs V6b :
+//   1. SESSION CONTINUE  : 07:00→17:00 UTC (London→NY sans gap)
+//   2. ASYMÉTRIQUE       : Longs → BOS_BULL / Shorts → CHoCH_BEAR
+//   3. SWEEP QUALITY     : min_sweep_quality >= 1 (assoupli)
+//   + Breakeven à +1R (V5)
+//   + RR asymétrique : Long=2.0 / Short=3.0 (V5)
+//   + Filtre EMA 50 4H dans les signaux
+//
+// ============================================================
+
+//@version=6
+strategy(
+     title                   = "SMC Strategy v7",
+     shorttitle              = "SMC-S v7",
+     overlay                 = true,
+     initial_capital         = 3000,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 1,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.007,
+     slippage                = 2,
+     process_orders_on_close = true,
+     max_bars_back           = 500,
+     pyramiding              = 0
+ )
+
+// ============================================================
+// SECTION 1 — PARAMÈTRES CONFIGURABLES
+// ============================================================
+
+var string GRP_FILTERS   = "Filtres SMC"
+var string GRP_FVG       = "Fair Value Gap"
+var string GRP_OB        = "Order Block"
+var string GRP_RISK      = "Gestion du risque"
+var string GRP_SWING     = "Swing / Sweep"
+var string GRP_INST      = "Niveaux Institutionnels"
+var string GRP_DISCOUNT  = "Zone Discount/Premium"
+var string GRP_DISPLAY   = "Affichage"
+
+sweep_lookback = input.int(
+     30, title="Lookback sweep récent (bougies)",
+     minval=5, maxval=60, group=GRP_FILTERS)
+
+min_sweep_quality = input.int(
+     1, title="Qualité sweep minimum (1=swing 2=Asian 3=PDH/PDL)",
+     minval=1, maxval=3, group=GRP_FILTERS,
+     tooltip="V7 : assoupli à 1 — accepte les sweeps de swing génériques")
+
+struct_lookback = input.int(
+     15, title="Lookback BOS / CHoCH (bougies)",
+     minval=5, maxval=50, group=GRP_FILTERS,
+     tooltip="Fenêtre pour BOS haussier (longs) et CHoCH baissier (shorts)")
+
+swing_lookback = input.int(
+     10, title="Lookback pivot swing",
+     minval=3, maxval=50, group=GRP_SWING)
+
+sweep_buffer_pips = input.float(
+     2.0, title="Buffer sweep (pips)",
+     minval=0.5, maxval=10.0, step=0.5, group=GRP_SWING)
+
+show_pdhl = input.bool(true,  title="Afficher PDH / PDL",          group=GRP_INST)
+show_pwhl = input.bool(true,  title="Afficher PWH / PWL",          group=GRP_INST)
+show_asr  = input.bool(true,  title="Afficher Asian Range",         group=GRP_INST)
+use_pwhl  = input.bool(false, title="Inclure PWH/PWL dans sweep",   group=GRP_INST)
+
+fvg_atr_mult = input.float(
+     1.5, title="Multiplicateur ATR impulsion FVG",
+     minval=0.5, maxval=5.0, step=0.1, group=GRP_FVG)
+
+ob_lookback = input.int(
+     15, title="Lookback Order Block (bougies)",
+     minval=3, maxval=40, group=GRP_OB)
+
+ob_body_atr_mult = input.float(
+     0.5, title="Corps OB minimum (x ATR)",
+     minval=0.1, maxval=2.0, step=0.1, group=GRP_OB)
+
+min_rr_long = input.float(
+     2.0, title="RR minimum — Longs (BOS)",
+     minval=1.5, maxval=6.0, step=0.1, group=GRP_RISK,
+     tooltip="2.0 adapté aux longs selon données empiriques V4/V5")
+
+min_rr_short = input.float(
+     3.0, title="RR minimum — Shorts (CHoCH)",
+     minval=1.5, maxval=6.0, step=0.1, group=GRP_RISK,
+     tooltip="3.0 adapté aux shorts selon données empiriques V4/V5")
+
+sl_min_pips = input.float(
+     10.0, title="SL minimum (pips)",
+     minval=5.0, maxval=30.0, step=1.0, group=GRP_RISK)
+
+sl_max_pips = input.float(
+     25.0, title="SL maximum (pips)",
+     minval=10.0, maxval=50.0, step=1.0, group=GRP_RISK)
+
+discount_period = input.int(
+     50, title="Période range Discount/Premium",
+     minval=20, maxval=200, group=GRP_DISCOUNT)
+
+use_discount_filter = input.bool(
+     false, title="Activer filtre Discount/Premium",
+     group=GRP_DISCOUNT)
+
+show_ema       = input.bool(true, title="EMA 50 (4H)",           group=GRP_DISPLAY)
+show_swings    = input.bool(true, title="Niveaux swing",          group=GRP_DISPLAY)
+show_fvg       = input.bool(true, title="Zones FVG",             group=GRP_DISPLAY)
+show_ob        = input.bool(true, title="Zones Order Block",      group=GRP_DISPLAY)
+show_discount  = input.bool(true, title="Zones Discount/Premium", group=GRP_DISPLAY)
+show_bos_lines = input.bool(true, title="Lignes BOS / CHoCH",    group=GRP_DISPLAY)
+show_labels    = input.bool(true, title="Labels signaux",         group=GRP_DISPLAY)
+show_table     = input.bool(true, title="Tableau récapitulatif",  group=GRP_DISPLAY)
+
+// ============================================================
+// SECTION 2 — UTILITAIRES
+// ============================================================
+
+PIP = syminfo.mintick * 10
+
+f_pips_to_price(pips) =>
+    pips * PIP
+
+f_price_to_pips(price_diff) =>
+    math.round(math.abs(price_diff) / PIP, 1)
+
+f_clamp(val, lo, hi) =>
+    math.max(lo, math.min(hi, val))
+
+// V7 : session continue London→NY 07:00→17:00 UTC (10h)
+f_in_session() =>
+    h             = hour(time, "UTC")
+    m             = minute(time, "UTC")
+    total_minutes = h * 60 + m
+    total_minutes >= 7 * 60 and total_minutes < 17 * 60
+
+f_in_asian_session() =>
+    h             = hour(time, "UTC")
+    m             = minute(time, "UTC")
+    total_minutes = h * 60 + m
+    total_minutes >= 0 and total_minutes < 7 * 60
+
+// ============================================================
+// SECTION 3 — EMA 50 4H + BIAIS DAILY
+// ============================================================
+
+ema_50_4h = request.security(
+     syminfo.tickerid, "240",
+     ta.ema(close, 50),
+     lookahead=barmerge.lookahead_off)
+
+close_daily  = request.security(syminfo.tickerid, "D", close,             lookahead=barmerge.lookahead_off)
+ema_50_daily = request.security(syminfo.tickerid, "D", ta.ema(close, 50), lookahead=barmerge.lookahead_off)
+
+daily_bias_bull = close_daily > ema_50_daily
+daily_bias_bear = close_daily < ema_50_daily
+
+plot(show_ema ? ema_50_4h : na,
+     title="EMA 50 (4H)", color=color.new(color.orange, 0), linewidth=2)
+
+if barstate.islast
+    label.new(bar_index, ta.highest(high, 10),
+         text      = daily_bias_bull ? "BIAS D: BULL" : "BIAS D: BEAR",
+         style     = label.style_label_left,
+         color     = daily_bias_bull ? color.new(color.green, 10) : color.new(color.red, 10),
+         textcolor = color.white,
+         size      = size.normal)
+
+// ============================================================
+// SECTION 4 — NIVEAUX INSTITUTIONNELS (PDH/PDL, PWH/PWL)
+// ============================================================
+
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_off)
+pwh = request.security(syminfo.tickerid, "W", high[1], lookahead=barmerge.lookahead_off)
+pwl = request.security(syminfo.tickerid, "W", low[1],  lookahead=barmerge.lookahead_off)
+
+if show_pdhl and barstate.islast
+    line.new(bar_index - 50, pdh, bar_index + 5, pdh,
+         color=color.white, style=line.style_dotted, width=2)
+    label.new(bar_index + 5, pdh, text="PDH",
+         style=label.style_label_left, color=color.new(color.white, 30),
+         textcolor=color.white, size=size.tiny)
+    line.new(bar_index - 50, pdl, bar_index + 5, pdl,
+         color=color.white, style=line.style_dotted, width=2)
+    label.new(bar_index + 5, pdl, text="PDL",
+         style=label.style_label_left, color=color.new(color.white, 30),
+         textcolor=color.white, size=size.tiny)
+
+if show_pwhl and barstate.islast
+    line.new(bar_index - 100, pwh, bar_index + 5, pwh,
+         color=color.new(color.silver, 40), style=line.style_dotted, width=1)
+    label.new(bar_index + 5, pwh, text="PWH",
+         style=label.style_label_left, color=color.new(color.gray, 50),
+         textcolor=color.white, size=size.tiny)
+    line.new(bar_index - 100, pwl, bar_index + 5, pwl,
+         color=color.new(color.silver, 40), style=line.style_dotted, width=1)
+    label.new(bar_index + 5, pwl, text="PWL",
+         style=label.style_label_left, color=color.new(color.gray, 50),
+         textcolor=color.white, size=size.tiny)
+
+// ============================================================
+// SECTION 5 — ASIAN SESSION RANGE (ASR)
+// ============================================================
+
+var float asian_high_track  = na
+var float asian_low_track   = na
+var float asian_high_prev   = na
+var float asian_low_prev    = na
+var int   asian_session_day = na
+
+current_day = dayofweek(time)
+is_asian    = f_in_asian_session()
+
+if is_asian
+    if na(asian_session_day) or asian_session_day != current_day
+        asian_session_day := current_day
+        asian_high_track  := high
+        asian_low_track   := low
+    else
+        if high > asian_high_track
+            asian_high_track := high
+        if low < asian_low_track
+            asian_low_track := low
+
+if not is_asian and not na(asian_high_track)
+    asian_high_prev := asian_high_track
+    asian_low_prev  := asian_low_track
+
+asr_high = asian_high_prev
+asr_low  = asian_low_prev
+
+if show_asr and barstate.islast and not na(asr_high) and not na(asr_low)
+    box.new(bar_index - 50, asr_high, bar_index + 5, asr_low,
+         border_color=color.new(color.gray, 50),
+         bgcolor=color.new(color.gray, 88), border_width=1)
+    label.new(bar_index - 25, asr_high, text="ASR H",
+         style=label.style_none, textcolor=color.new(color.gray, 30), size=size.tiny)
+    label.new(bar_index - 25, asr_low, text="ASR L",
+         style=label.style_none, textcolor=color.new(color.gray, 30), size=size.tiny)
+
+// ============================================================
+// SECTION 6 — ZONE DISCOUNT / PREMIUM
+// ============================================================
+
+range_high  = ta.highest(high, discount_period)
+range_low   = ta.lowest(low,  discount_period)
+midpoint    = (range_high + range_low) / 2.0
+in_discount = close < midpoint
+in_premium  = close > midpoint
+
+if show_discount and barstate.islast
+    box.new(bar_index - discount_period, range_low, bar_index + 5, midpoint,
+         border_color=color.new(color.green, 80), bgcolor=color.new(color.green, 93), border_width=1)
+    box.new(bar_index - discount_period, midpoint, bar_index + 5, range_high,
+         border_color=color.new(color.red, 80), bgcolor=color.new(color.red, 93), border_width=1)
+
+// ============================================================
+// SECTION 7 — SWING HIGHS / LOWS
+// ============================================================
+
+atr_14 = ta.atr(14)
+
+raw_swing_high = ta.pivothigh(high, swing_lookback, swing_lookback)
+raw_swing_low  = ta.pivotlow(low,   swing_lookback, swing_lookback)
+
+var float last_swing_high = na
+var float last_swing_low  = na
+
+if not na(raw_swing_high)
+    last_swing_high := raw_swing_high
+if not na(raw_swing_low)
+    last_swing_low := raw_swing_low
+
+if show_swings and not na(raw_swing_high)
+    line.new(bar_index - swing_lookback, raw_swing_high, bar_index, raw_swing_high,
+         color=color.new(color.red, 50), style=line.style_dotted, width=1)
+
+if show_swings and not na(raw_swing_low)
+    line.new(bar_index - swing_lookback, raw_swing_low, bar_index, raw_swing_low,
+         color=color.new(color.green, 50), style=line.style_dotted, width=1)
+
+// ============================================================
+// SECTION 8 — SWEEP INSTITUTIONNEL (qualité 1/2/3)
+// ============================================================
+
+sweep_buffer = f_pips_to_price(sweep_buffer_pips)
+
+f_sweep_bull_quality() =>
+    q = 0
+    if not na(pdl) and low < pdl - sweep_buffer and close > pdl and close > open
+        q := 3
+    else if not na(asr_low) and low < asr_low - sweep_buffer and close > asr_low and close > open
+        q := 2
+    else if use_pwhl and not na(pwl) and low < pwl - sweep_buffer and close > pwl and close > open
+        q := 2
+    else if not na(last_swing_low) and low < last_swing_low - sweep_buffer and close > last_swing_low and close > open
+        q := 1
+    q
+
+f_sweep_bear_quality() =>
+    q = 0
+    if not na(pdh) and high > pdh + sweep_buffer and close < pdh and close < open
+        q := 3
+    else if not na(asr_high) and high > asr_high + sweep_buffer and close < asr_high and close < open
+        q := 2
+    else if use_pwhl and not na(pwh) and high > pwh + sweep_buffer and close < pwh and close < open
+        q := 2
+    else if not na(last_swing_high) and high > last_swing_high + sweep_buffer and close < last_swing_high and close < open
+        q := 1
+    q
+
+sweep_bull_quality_now = f_sweep_bull_quality()
+sweep_bear_quality_now = f_sweep_bear_quality()
+
+sweep_low_cond  = sweep_bull_quality_now >= 1 and daily_bias_bull
+sweep_high_cond = sweep_bear_quality_now >= 1 and daily_bias_bear
+
+var float last_sweep_low_price  = na
+var float last_sweep_high_price = na
+var int   last_sweep_low_q      = 0
+var int   last_sweep_high_q     = 0
+
+if sweep_low_cond
+    last_sweep_low_price := low
+    last_sweep_low_q     := sweep_bull_quality_now
+if sweep_high_cond
+    last_sweep_high_price := high
+    last_sweep_high_q     := sweep_bear_quality_now
+
+sweep_low_recent  = ta.barssince(sweep_low_cond)  <= sweep_lookback
+     and last_sweep_low_q  >= min_sweep_quality
+sweep_high_recent = ta.barssince(sweep_high_cond) <= sweep_lookback
+     and last_sweep_high_q >= min_sweep_quality
+
+// ============================================================
+// SECTION 9 — BOS (Longs) + CHoCH (Shorts)
+// ============================================================
+// ASYMÉTRIQUE V7 :
+//   LONGS  → BOS_BULL  : break de structure simple après sweep
+//   SHORTS → CHoCH_BEAR: break conditionnel au sweep_high_recent
+
+struct_ref_high = ta.highest(high, struct_lookback)[1]
+struct_ref_low  = ta.lowest(low,  struct_lookback)[1]
+
+// BOS haussier : break de structure simple (sweep vérifié dans long_signal)
+bos_bull_cond = close > struct_ref_high
+     and close[1] <= struct_ref_high
+
+// CHoCH baissier : conditionnel au sweep_high_recent
+choch_bear = sweep_high_recent
+     and close < struct_ref_low
+     and close[1] >= struct_ref_low
+     and daily_bias_bear
+
+if bos_bull_cond and sweep_low_recent and show_bos_lines
+    line.new(bar_index - 1, struct_ref_high, bar_index, struct_ref_high,
+         color=color.new(color.aqua, 20), style=line.style_dashed, width=2)
+    if show_labels
+        label.new(bar_index, low, text="BOS ▲",
+             style=label.style_label_up,
+             color=color.new(color.aqua, 10), textcolor=color.white, size=size.small)
+
+if choch_bear and show_bos_lines
+    line.new(bar_index - 1, struct_ref_low, bar_index, struct_ref_low,
+         color=color.new(color.red, 20), style=line.style_dashed, width=2)
+    if show_labels
+        label.new(bar_index, high, text="CHoCH ▼",
+             style=label.style_label_down,
+             color=color.new(color.red, 10), textcolor=color.white, size=size.small)
+
+// ============================================================
+// SECTION 10 — FAIR VALUE GAP (FVG)
+// ============================================================
+
+fvg_impulse  = (high[1] - low[1]) > fvg_atr_mult * atr_14
+fvg_bull_new = fvg_impulse and high[2] < low[0]
+fvg_bear_new = fvg_impulse and low[2]  > high[0]
+
+var float[] fvg_bull_top = array.new_float(3, na)
+var float[] fvg_bull_bot = array.new_float(3, na)
+var float[] fvg_bear_top = array.new_float(3, na)
+var float[] fvg_bear_bot = array.new_float(3, na)
+
+if fvg_bull_new
+    array.set(fvg_bull_top, 2, array.get(fvg_bull_top, 1))
+    array.set(fvg_bull_bot, 2, array.get(fvg_bull_bot, 1))
+    array.set(fvg_bull_top, 1, array.get(fvg_bull_top, 0))
+    array.set(fvg_bull_bot, 1, array.get(fvg_bull_bot, 0))
+    array.set(fvg_bull_top, 0, low[0])
+    array.set(fvg_bull_bot, 0, high[2])
+
+if fvg_bear_new
+    array.set(fvg_bear_top, 2, array.get(fvg_bear_top, 1))
+    array.set(fvg_bear_bot, 2, array.get(fvg_bear_bot, 1))
+    array.set(fvg_bear_top, 1, array.get(fvg_bear_top, 0))
+    array.set(fvg_bear_bot, 1, array.get(fvg_bear_bot, 0))
+    array.set(fvg_bear_top, 0, low[2])
+    array.set(fvg_bear_bot, 0, high[0])
+
+for i = 0 to 2
+    bt  = array.get(fvg_bull_top, i)
+    bb  = array.get(fvg_bull_bot, i)
+    if not na(bt) and not na(bb) and close < bb
+        array.set(fvg_bull_top, i, na)
+        array.set(fvg_bull_bot, i, na)
+    bt2 = array.get(fvg_bear_top, i)
+    bb2 = array.get(fvg_bear_bot, i)
+    if not na(bt2) and not na(bb2) and close > bt2
+        array.set(fvg_bear_top, i, na)
+        array.set(fvg_bear_bot, i, na)
+
+f_price_in_bull_fvg(p) =>
+    result = false
+    for i = 0 to 2
+        bt = array.get(fvg_bull_top, i)
+        bb = array.get(fvg_bull_bot, i)
+        if not na(bt) and not na(bb) and p >= bb and p <= bt
+            result := true
+    result
+
+f_price_in_bear_fvg(p) =>
+    result = false
+    for i = 0 to 2
+        bt = array.get(fvg_bear_top, i)
+        bb = array.get(fvg_bear_bot, i)
+        if not na(bt) and not na(bb) and p >= bb and p <= bt
+            result := true
+    result
+
+f_bull_fvg_bot() =>
+    result = float(na)
+    for i = 0 to 2
+        bb = array.get(fvg_bull_bot, i)
+        if not na(bb) and na(result)
+            result := bb
+    result
+
+f_bear_fvg_top() =>
+    result = float(na)
+    for i = 0 to 2
+        bt = array.get(fvg_bear_top, i)
+        if not na(bt) and na(result)
+            result := bt
+    result
+
+if show_fvg and fvg_bull_new
+    box.new(bar_index - 2, low[0], bar_index + 20, high[2],
+         border_color=color.new(color.blue, 60), bgcolor=color.new(color.blue, 80), border_width=1)
+    if show_labels
+        label.new(bar_index, (low[0] + high[2]) / 2, text="FVG",
+             style=label.style_none, textcolor=color.new(color.blue, 20), size=size.tiny)
+
+if show_fvg and fvg_bear_new
+    box.new(bar_index - 2, low[2], bar_index + 20, high[0],
+         border_color=color.new(color.orange, 60), bgcolor=color.new(color.orange, 80), border_width=1)
+    if show_labels
+        label.new(bar_index, (low[2] + high[0]) / 2, text="FVG",
+             style=label.style_none, textcolor=color.new(color.orange, 20), size=size.tiny)
+
+// ============================================================
+// SECTION 11 — ORDER BLOCK INSTITUTIONNEL
+// ============================================================
+// OB Bull : créé sur BOS_BULL + sweep_low_recent (longs)
+// OB Bear : créé sur CHoCH_BEAR                  (shorts)
+
+var float[] ob_bull_top = array.new_float(3, na)
+var float[] ob_bull_bot = array.new_float(3, na)
+var float[] ob_bear_top = array.new_float(3, na)
+var float[] ob_bear_bot = array.new_float(3, na)
+
+f_last_bear_candle_inst() =>
+    o_val = float(na)
+    c_val = float(na)
+    for i = 1 to ob_lookback
+        body = math.abs(close[i] - open[i])
+        if close[i] < open[i] and body > ob_body_atr_mult * atr_14[i]
+            o_val := open[i]
+            c_val := close[i]
+            break
+    [o_val, c_val]
+
+f_last_bull_candle_inst() =>
+    o_val = float(na)
+    c_val = float(na)
+    for i = 1 to ob_lookback
+        body = math.abs(close[i] - open[i])
+        if close[i] > open[i] and body > ob_body_atr_mult * atr_14[i]
+            o_val := open[i]
+            c_val := close[i]
+            break
+    [o_val, c_val]
+
+if bos_bull_cond and sweep_low_recent
+    [ob_open, ob_close] = f_last_bear_candle_inst()
+    if not na(ob_open) and not na(ob_close)
+        array.set(ob_bull_top, 2, array.get(ob_bull_top, 1))
+        array.set(ob_bull_bot, 2, array.get(ob_bull_bot, 1))
+        array.set(ob_bull_top, 1, array.get(ob_bull_top, 0))
+        array.set(ob_bull_bot, 1, array.get(ob_bull_bot, 0))
+        array.set(ob_bull_top, 0, ob_open)
+        array.set(ob_bull_bot, 0, ob_close)
+
+if choch_bear
+    [ob_open, ob_close] = f_last_bull_candle_inst()
+    if not na(ob_open) and not na(ob_close)
+        array.set(ob_bear_top, 2, array.get(ob_bear_top, 1))
+        array.set(ob_bear_bot, 2, array.get(ob_bear_bot, 1))
+        array.set(ob_bear_top, 1, array.get(ob_bear_top, 0))
+        array.set(ob_bear_bot, 1, array.get(ob_bear_bot, 0))
+        array.set(ob_bear_top, 0, ob_close)
+        array.set(ob_bear_bot, 0, ob_open)
+
+for i = 0 to 2
+    bt  = array.get(ob_bull_top, i)
+    bb  = array.get(ob_bull_bot, i)
+    if not na(bt) and not na(bb) and close < bb
+        array.set(ob_bull_top, i, na)
+        array.set(ob_bull_bot, i, na)
+    bt2 = array.get(ob_bear_top, i)
+    bb2 = array.get(ob_bear_bot, i)
+    if not na(bt2) and not na(bb2) and close > bt2
+        array.set(ob_bear_top, i, na)
+        array.set(ob_bear_bot, i, na)
+
+f_price_in_bull_ob(p) =>
+    result = false
+    for i = 0 to 2
+        bt = array.get(ob_bull_top, i)
+        bb = array.get(ob_bull_bot, i)
+        if not na(bt) and not na(bb) and p >= bb and p <= bt
+            result := true
+    result
+
+f_price_in_bear_ob(p) =>
+    result = false
+    for i = 0 to 2
+        bt = array.get(ob_bear_top, i)
+        bb = array.get(ob_bear_bot, i)
+        if not na(bt) and not na(bb) and p >= bb and p <= bt
+            result := true
+    result
+
+f_bull_ob_bot() =>
+    result = float(na)
+    for i = 0 to 2
+        bb = array.get(ob_bull_bot, i)
+        if not na(bb) and na(result)
+            result := bb
+    result
+
+f_bear_ob_top() =>
+    result = float(na)
+    for i = 0 to 2
+        bt = array.get(ob_bear_top, i)
+        if not na(bt) and na(result)
+            result := bt
+    result
+
+if show_ob and bos_bull_cond and sweep_low_recent
+    ob_t = array.get(ob_bull_top, 0)
+    ob_b = array.get(ob_bull_bot, 0)
+    if not na(ob_t) and not na(ob_b)
+        box.new(bar_index - ob_lookback, ob_t, bar_index + 30, ob_b,
+             border_color=color.new(color.green, 40), bgcolor=color.new(color.green, 75), border_width=1)
+        if show_labels
+            label.new(bar_index, (ob_t + ob_b) / 2, text="OB",
+                 style=label.style_none, textcolor=color.new(color.green, 20), size=size.tiny)
+
+if show_ob and choch_bear
+    ob_t = array.get(ob_bear_top, 0)
+    ob_b = array.get(ob_bear_bot, 0)
+    if not na(ob_t) and not na(ob_b)
+        box.new(bar_index - ob_lookback, ob_t, bar_index + 30, ob_b,
+             border_color=color.new(color.red, 40), bgcolor=color.new(color.red, 75), border_width=1)
+        if show_labels
+            label.new(bar_index, (ob_t + ob_b) / 2, text="OB",
+                 style=label.style_none, textcolor=color.new(color.red, 20), size=size.tiny)
+
+// ============================================================
+// SECTION 12 — SIGNAUX D'ENTRÉE V7
+// ============================================================
+// LONG  : sweep_low_recent + BOS_BULL dans fenêtre + FVG/OB
+// SHORT : CHoCH_BEAR dans fenêtre + FVG/OB (CHoCH implique sweep)
+
+in_session   = f_in_session()
+in_bull_zone = f_price_in_bull_fvg(close) or f_price_in_bull_ob(close)
+in_bear_zone = f_price_in_bear_fvg(close) or f_price_in_bear_ob(close)
+
+discount_ok_long  = not use_discount_filter or in_discount
+discount_ok_short = not use_discount_filter or in_premium
+
+long_signal = sweep_low_recent
+     and ta.barssince(bos_bull_cond) <= sweep_lookback
+     and in_bull_zone
+     and discount_ok_long
+     and in_session
+     and close > ema_50_4h
+     and daily_bias_bull
+     and strategy.position_size == 0
+
+short_signal = ta.barssince(choch_bear) <= sweep_lookback
+     and sweep_high_recent
+     and in_bear_zone
+     and discount_ok_short
+     and in_session
+     and close < ema_50_4h
+     and daily_bias_bear
+     and strategy.position_size == 0
+
+// ============================================================
+// SECTION 13 — SL DYNAMIQUE
+// ============================================================
+
+f_sl_long() =>
+    ob_bot  = f_bull_ob_bot()
+    fvg_bot = f_bull_fvg_bot()
+    sl_raw  = float(na)
+    if not na(last_sweep_low_price)
+        sl_raw := last_sweep_low_price - f_pips_to_price(2.0)
+    else if not na(ob_bot)
+        sl_raw := ob_bot - f_pips_to_price(2.0)
+    else if not na(fvg_bot)
+        sl_raw := fvg_bot - f_pips_to_price(2.0)
+    else
+        sl_raw := close - f_pips_to_price(20.0)
+    sl_pips_calc    = f_price_to_pips(close - sl_raw)
+    sl_pips_clamped = f_clamp(sl_pips_calc, sl_min_pips, sl_max_pips)
+    close - f_pips_to_price(sl_pips_clamped)
+
+f_sl_short() =>
+    ob_top  = f_bear_ob_top()
+    fvg_top = f_bear_fvg_top()
+    sl_raw  = float(na)
+    if not na(last_sweep_high_price)
+        sl_raw := last_sweep_high_price + f_pips_to_price(2.0)
+    else if not na(ob_top)
+        sl_raw := ob_top + f_pips_to_price(2.0)
+    else if not na(fvg_top)
+        sl_raw := fvg_top + f_pips_to_price(2.0)
+    else
+        sl_raw := close + f_pips_to_price(20.0)
+    sl_pips_calc    = f_price_to_pips(sl_raw - close)
+    sl_pips_clamped = f_clamp(sl_pips_calc, sl_min_pips, sl_max_pips)
+    close + f_pips_to_price(sl_pips_clamped)
+
+// ============================================================
+// SECTION 14 — TP INTELLIGENT (asymétrique Long/Short)
+// ============================================================
+
+f_tp_long(sl_price) =>
+    sl_dist    = close - sl_price
+    tp_rr      = close + sl_dist * min_rr_long
+    tp_pdh     = not na(pdh) and pdh > close + sl_dist * min_rr_long ? pdh : float(na)
+    ob_res     = f_bear_ob_top()
+    tp_ob      = not na(ob_res) and ob_res > close + sl_dist * min_rr_long ? ob_res : float(na)
+    next_pivot = ta.pivothigh(high, swing_lookback, 0)
+    tp_pivot   = not na(next_pivot) and next_pivot > close + sl_dist * min_rr_long ? next_pivot : float(na)
+    if not na(tp_pdh)
+        tp_pdh
+    else if not na(tp_ob)
+        tp_ob
+    else if not na(tp_pivot)
+        tp_pivot
+    else
+        tp_rr
+
+f_tp_short(sl_price) =>
+    sl_dist    = sl_price - close
+    tp_rr      = close - sl_dist * min_rr_short
+    tp_pdl     = not na(pdl) and pdl < close - sl_dist * min_rr_short ? pdl : float(na)
+    ob_sup     = f_bull_ob_bot()
+    tp_ob      = not na(ob_sup) and ob_sup < close - sl_dist * min_rr_short ? ob_sup : float(na)
+    next_pivot = ta.pivotlow(low, swing_lookback, 0)
+    tp_pivot   = not na(next_pivot) and next_pivot < close - sl_dist * min_rr_short ? next_pivot : float(na)
+    if not na(tp_pdl)
+        tp_pdl
+    else if not na(tp_ob)
+        tp_ob
+    else if not na(tp_pivot)
+        tp_pivot
+    else
+        tp_rr
+
+// ============================================================
+// SECTION 15 — BREAKEVEN À +1R
+// ============================================================
+
+var float entry_price_mem   = na
+var float sl_initial_pips_m = na
+var bool  be_triggered      = false
+var float tp_long_mem       = na
+var float tp_short_mem      = na
+
+if strategy.position_size[1] != 0 and strategy.position_size == 0
+    entry_price_mem   := na
+    sl_initial_pips_m := na
+    be_triggered      := false
+    tp_long_mem       := na
+    tp_short_mem      := na
+
+if strategy.position_size > 0 and not be_triggered and not na(entry_price_mem)
+    profit_pips_be = f_price_to_pips(close - entry_price_mem)
+    if profit_pips_be >= sl_initial_pips_m
+        be_triggered := true
+        strategy.exit("Long TP/SL", from_entry="Long",
+             stop  = entry_price_mem + f_pips_to_price(1.0),
+             limit = tp_long_mem)
+
+if strategy.position_size < 0 and not be_triggered and not na(entry_price_mem)
+    profit_pips_be = f_price_to_pips(entry_price_mem - close)
+    if profit_pips_be >= sl_initial_pips_m
+        be_triggered := true
+        strategy.exit("Short TP/SL", from_entry="Short",
+             stop  = entry_price_mem - f_pips_to_price(1.0),
+             limit = tp_short_mem)
+
+// ============================================================
+// SECTION 16 — ENTRÉES / SORTIES
+// ============================================================
+
+sl_long_price  = f_sl_long()
+sl_short_price = f_sl_short()
+
+sl_long_pips  = f_price_to_pips(close - sl_long_price)
+sl_short_pips = f_price_to_pips(sl_short_price - close)
+
+sl_long_ok  = sl_long_pips  >= sl_min_pips and sl_long_pips  <= sl_max_pips
+sl_short_ok = sl_short_pips >= sl_min_pips and sl_short_pips <= sl_max_pips
+
+tp_long_price  = f_tp_long(sl_long_price)
+tp_short_price = f_tp_short(sl_short_price)
+
+rr_long  = sl_long_pips  > 0 ? f_price_to_pips(tp_long_price  - close) / sl_long_pips  : 0.0
+rr_short = sl_short_pips > 0 ? f_price_to_pips(close - tp_short_price) / sl_short_pips : 0.0
+
+rr_long_ok  = rr_long  >= min_rr_long
+rr_short_ok = rr_short >= min_rr_short
+
+if long_signal and sl_long_ok and rr_long_ok
+    q_label = last_sweep_low_q == 3 ? "PDL" : last_sweep_low_q == 2 ? "ASR" : "SW"
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long TP/SL", from_entry="Long",
+         stop=sl_long_price, limit=tp_long_price)
+    entry_price_mem   := close
+    sl_initial_pips_m := sl_long_pips
+    be_triggered      := false
+    tp_long_mem       := tp_long_price
+    if show_labels
+        label.new(bar_index, low,
+             text  = "L [" + q_label + "]  SL:" + str.tostring(math.round(sl_long_pips, 1)) + "p  RR:" + str.tostring(math.round(rr_long, 1)),
+             style = label.style_label_up,
+             color = color.new(color.teal, 10), textcolor=color.white, size=size.tiny)
+
+if short_signal and sl_short_ok and rr_short_ok
+    q_label = last_sweep_high_q == 3 ? "PDH" : last_sweep_high_q == 2 ? "ASR" : "SW"
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short TP/SL", from_entry="Short",
+         stop=sl_short_price, limit=tp_short_price)
+    entry_price_mem   := close
+    sl_initial_pips_m := sl_short_pips
+    be_triggered      := false
+    tp_short_mem      := tp_short_price
+    if show_labels
+        label.new(bar_index, high,
+             text  = "S [" + q_label + "]  SL:" + str.tostring(math.round(sl_short_pips, 1)) + "p  RR:" + str.tostring(math.round(rr_short, 1)),
+             style = label.style_label_down,
+             color = color.new(color.maroon, 10), textcolor=color.white, size=size.tiny)
+
+// ============================================================
+// SECTION 17 — TABLEAU RÉCAPITULATIF
+// ============================================================
+
+var table stats_table = table.new(
+     position.top_right, 2, 16,
+     bgcolor      = color.new(color.black, 20),
+     border_width = 1,
+     border_color = color.new(color.gray, 50)
+ )
+
+if barstate.islast and show_table
+    total_trades  = strategy.closedtrades
+    winning       = strategy.wintrades
+    winrate       = total_trades > 0 ? math.round(winning / total_trades * 100, 1) : 0.0
+    gross_profit  = strategy.grossprofit
+    gross_loss    = math.abs(strategy.grossloss)
+    profit_factor = gross_loss > 0 ? math.round(gross_profit / gross_loss, 2) : 0.0
+    net_pnl       = strategy.netprofit
+    max_dd        = math.round(strategy.max_drawdown / strategy.initial_capital * 100, 1)
+
+    // Calcul séparé Longs (BOS) / Shorts (CHoCH)
+    long_total_n   = 0
+    long_wins_n    = 0
+    long_prof_sum  = 0.0
+    long_loss_sum  = 0.0
+    short_total_n  = 0
+    short_wins_n   = 0
+    short_prof_sum = 0.0
+    short_loss_sum = 0.0
+
+    for i = 0 to total_trades - 1
+        tsize = strategy.closedtrades.size(i)
+        tpnl  = strategy.closedtrades.profit(i)
+        if tsize > 0
+            long_total_n := long_total_n + 1
+            if tpnl > 0
+                long_wins_n   := long_wins_n + 1
+                long_prof_sum := long_prof_sum + tpnl
+            else
+                long_loss_sum := long_loss_sum + math.abs(tpnl)
+        else
+            short_total_n := short_total_n + 1
+            if tpnl > 0
+                short_wins_n   := short_wins_n + 1
+                short_prof_sum := short_prof_sum + tpnl
+            else
+                short_loss_sum := short_loss_sum + math.abs(tpnl)
+
+    long_wr        = long_total_n  > 0 ? math.round(long_wins_n  / long_total_n  * 100, 1) : 0.0
+    short_wr       = short_total_n > 0 ? math.round(short_wins_n / short_total_n * 100, 1) : 0.0
+    long_avg_win   = long_wins_n  > 0 ? long_prof_sum  / long_wins_n  : 0.0
+    long_avg_los   = (long_total_n  - long_wins_n)  > 0 ? long_loss_sum  / (long_total_n  - long_wins_n)  : 1.0
+    long_rr_real   = long_avg_los  > 0 ? math.round(long_avg_win  / long_avg_los,  2) : 0.0
+    short_avg_win  = short_wins_n > 0 ? short_prof_sum / short_wins_n : 0.0
+    short_avg_los  = (short_total_n - short_wins_n) > 0 ? short_loss_sum / (short_total_n - short_wins_n) : 1.0
+    short_rr_real  = short_avg_los > 0 ? math.round(short_avg_win / short_avg_los, 2) : 0.0
+
+    // Row 0 — Header
+    table.cell(stats_table, 0, 0, "SMC Strategy v7",
+         text_color=color.white, text_halign=text.align_left,
+         bgcolor=color.new(color.navy, 20), text_size=size.small)
+    table.cell(stats_table, 1, 0, "BOS + CHoCH",
+         text_color=color.white, text_halign=text.align_right,
+         bgcolor=color.new(color.navy, 20), text_size=size.small)
+
+    // Row 1-3 — Global
+    table.cell(stats_table, 0, 1, "Trades total",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 1, str.tostring(total_trades),
+         text_color=total_trades >= 40 ? color.green : total_trades >= 20 ? color.yellow : color.red,
+         text_halign=text.align_right, text_size=size.small)
+
+    table.cell(stats_table, 0, 2, "Winrate global",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 2, str.tostring(winrate) + " %",
+         text_color=winrate >= 30 ? color.green : color.red,
+         text_halign=text.align_right, text_size=size.small)
+
+    table.cell(stats_table, 0, 3, "Profit Factor",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 3, str.tostring(profit_factor),
+         text_color=profit_factor >= 1.1 ? color.green : profit_factor >= 1.0 ? color.yellow : color.red,
+         text_halign=text.align_right, text_size=size.small)
+
+    // Row 4 — Section Longs
+    table.cell(stats_table, 0, 4, "── Longs (BOS) ──",
+         text_color=color.new(color.aqua, 10), text_halign=text.align_left,
+         bgcolor=color.new(color.teal, 75), text_size=size.small)
+    table.cell(stats_table, 1, 4, "",
+         bgcolor=color.new(color.teal, 75), text_size=size.small)
+
+    table.cell(stats_table, 0, 5, "  Trades",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 5, str.tostring(long_total_n),
+         text_color=long_total_n >= 20 ? color.green : color.yellow,
+         text_halign=text.align_right, text_size=size.small)
+
+    table.cell(stats_table, 0, 6, "  Winrate",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 6, str.tostring(long_wr) + " %",
+         text_color=long_wr >= 20 ? color.green : color.red,
+         text_halign=text.align_right, text_size=size.small)
+
+    table.cell(stats_table, 0, 7, "  RR moyen",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 7, "1:" + str.tostring(long_rr_real),
+         text_color=long_rr_real >= 2.0 ? color.green : color.yellow,
+         text_halign=text.align_right, text_size=size.small)
+
+    // Row 8 — Section Shorts
+    table.cell(stats_table, 0, 8, "── Shorts (CHoCH) ──",
+         text_color=color.white, text_halign=text.align_left,
+         bgcolor=color.new(color.maroon, 65), text_size=size.small)
+    table.cell(stats_table, 1, 8, "",
+         bgcolor=color.new(color.maroon, 65), text_size=size.small)
+
+    table.cell(stats_table, 0, 9, "  Trades",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 9, str.tostring(short_total_n),
+         text_color=short_total_n >= 20 ? color.green : color.yellow,
+         text_halign=text.align_right, text_size=size.small)
+
+    table.cell(stats_table, 0, 10, "  Winrate",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 10, str.tostring(short_wr) + " %",
+         text_color=short_wr >= 30 ? color.green : color.red,
+         text_halign=text.align_right, text_size=size.small)
+
+    table.cell(stats_table, 0, 11, "  RR moyen",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 11, "1:" + str.tostring(short_rr_real),
+         text_color=short_rr_real >= 3.0 ? color.green : color.yellow,
+         text_halign=text.align_right, text_size=size.small)
+
+    // Row 12-15 — Synthèse
+    table.cell(stats_table, 0, 12, "Net PnL",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 12, (net_pnl >= 0 ? "+" : "") + str.tostring(math.round(net_pnl, 2)) + " $",
+         text_color=net_pnl >= 0 ? color.green : color.red,
+         text_halign=text.align_right, text_size=size.small)
+
+    table.cell(stats_table, 0, 13, "Max Drawdown",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 13, str.tostring(max_dd) + " %",
+         text_color=max_dd <= 15 ? color.green : max_dd <= 25 ? color.yellow : color.red,
+         text_halign=text.align_right, text_size=size.small)
+
+    table.cell(stats_table, 0, 14, "Session",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 14, f_in_session() ? "07-17h UTC" : "Hors session",
+         text_color=f_in_session() ? color.green : color.gray,
+         text_halign=text.align_right, text_size=size.small)
+
+    table.cell(stats_table, 0, 15, "Biais Daily",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 15, daily_bias_bull ? "BULL" : "BEAR",
+         text_color=daily_bias_bull ? color.green : color.red,
+         text_halign=text.align_right, text_size=size.small)

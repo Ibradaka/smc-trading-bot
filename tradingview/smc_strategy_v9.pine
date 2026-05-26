@@ -1,0 +1,843 @@
+// ============================================================
+// SMC Strategy v9 — Institutional Full Stack
+// Projet   : SMC Trading Bot
+// Version  : 9.0.0
+// Auteur   : Ibradaka
+// Date     : 2026-05-17
+// ============================================================
+//
+// ARCHITECTURE :
+//   1. Liquidité       — EQH/EQL, Sweep H/L, PDH/PDL, ASR
+//   2. Structure       — BOS+/-, CHoCH
+//   3. Zones réaction  — FVG bullish/bearish, OB bull/bear
+//   4. Filtres         — Session, EMA 200 HTF, ATR volatilité
+//   5. Confirmations   — min 1 combinaison parmi 6 paires valides
+//   6. Risque          — 50 USD/trade, RR≥2, SL validé, max 3 pos
+//   7. Gestion pos.    — Breakeven, partial TP, trailing, struct exit
+//   8. Dashboard       — stats live
+//
+// ANTI-REPAINT :
+//   - Toutes les conditions évaluées sur barstate.isconfirmed
+//   - Aucun lookahead (request.security lookahead_off)
+//   - SL/TP stockés à l'entrée, jamais recalculés depuis les barres futures
+// ============================================================
+
+//@version=6
+strategy(
+    title                   = "SMC Strategy v9 — Institutional Full Stack",
+    shorttitle              = "SMC v9",
+    overlay                 = true,
+    initial_capital         = 5000,
+    default_qty_type        = strategy.fixed,
+    default_qty_value       = 1000,
+    commission_type         = strategy.commission.cash_per_order,
+    commission_value        = 0.70,
+    slippage                = 2,
+    process_orders_on_close = true,
+    max_bars_back           = 500,
+    pyramiding              = 0,
+    margin_long             = 2.0,
+    margin_short            = 2.0
+)
+
+// ============================================================
+// SECTION 1 — PARAMÈTRES CONFIGURABLES
+// ============================================================
+
+var string GRP_RISK    = "Risque & Capital"
+var string GRP_LIQ     = "Liquidite"
+var string GRP_STRUCT  = "Structure de marche"
+var string GRP_FVG     = "Fair Value Gap"
+var string GRP_OB      = "Order Block"
+var string GRP_FILTER  = "Filtres"
+var string GRP_SESSION = "Sessions"
+var string GRP_MGMT    = "Gestion de position"
+var string GRP_DISP    = "Affichage"
+
+// --- Risque ---
+risk_usd      = input.float(25.0, "Risque par trade (USD)",       minval=5,   maxval=500,  step=5,   group=GRP_RISK)
+min_rr        = input.float(2.0,  "RR minimum",                   minval=1.0, maxval=6.0,  step=0.1, group=GRP_RISK)
+sl_min_pips   = input.int(8,      "SL minimum (pips)",            minval=3,   maxval=50,             group=GRP_RISK)
+sl_max_pips   = input.int(35,     "SL maximum (pips)",            minval=10,  maxval=150,            group=GRP_RISK)
+
+// --- Liquidité ---
+eq_lookback   = input.int(20,     "Lookback EQH/EQL (bougies)",   minval=5,   maxval=100,            group=GRP_LIQ)
+eq_pip_tol    = input.float(3.0,  "Tolerance EQH/EQL (pips)",     minval=0.5, maxval=10.0, step=0.5, group=GRP_LIQ)
+sweep_lookback= input.int(30,     "Lookback sweep (bougies)",      minval=5,   maxval=80,             group=GRP_LIQ)
+show_eqh_eql  = input.bool(true,  "Afficher EQH / EQL",                                             group=GRP_LIQ)
+show_sweeps   = input.bool(true,  "Afficher sweeps",                                                  group=GRP_LIQ)
+show_pdhl     = input.bool(true,  "Afficher PDH / PDL",                                             group=GRP_LIQ)
+show_asr      = input.bool(true,  "Afficher Asian Range",                                            group=GRP_LIQ)
+
+// --- Structure ---
+struct_lookback = input.int(15,   "Lookback BOS/CHoCH (bougies)", minval=5,   maxval=50,             group=GRP_STRUCT)
+swing_lookback  = input.int(10,   "Lookback pivot swing",          minval=3,   maxval=30,             group=GRP_STRUCT)
+show_bos        = input.bool(true, "Afficher BOS",                                                   group=GRP_STRUCT)
+show_choch      = input.bool(true, "Afficher CHoCH",                                                 group=GRP_STRUCT)
+
+// --- FVG ---
+fvg_atr_mult  = input.float(1.2,  "Impulsion FVG minimum (xATR)", minval=0.3, maxval=5.0, step=0.1, group=GRP_FVG)
+fvg_max_slots = input.int(3,      "Slots FVG actifs",              minval=1,   maxval=5,             group=GRP_FVG)
+show_fvg      = input.bool(true,  "Afficher FVG",                                                    group=GRP_FVG)
+
+// --- Order Block ---
+ob_lookback   = input.int(15,     "Lookback OB (bougies)",         minval=3,   maxval=40,            group=GRP_OB)
+ob_atr_mult   = input.float(0.4,  "Corps OB minimum (xATR)",       minval=0.1, maxval=2.0, step=0.1, group=GRP_OB)
+ob_max_slots  = input.int(2,      "Slots OB actifs",               minval=1,   maxval=4,             group=GRP_OB)
+show_ob       = input.bool(true,  "Afficher OB",                                                     group=GRP_OB)
+
+// --- Filtres ---
+use_ema_filter= input.bool(true,  "Filtre EMA 200 (4H)",                                             group=GRP_FILTER)
+ema_len_htf   = input.int(200,    "Longueur EMA HTF",              minval=20,  maxval=500,           group=GRP_FILTER)
+use_atr_filter= input.bool(true,  "Filtre ATR volatilite",                                           group=GRP_FILTER)
+atr_pct       = input.float(0.75, "ATR seuil (x moyenne 50)",      minval=0.3, maxval=1.5, step=0.05, group=GRP_FILTER)
+use_candle_cf = input.bool(false, "Confirmation bougie (corps>50%)",                                  group=GRP_FILTER)
+use_discount  = input.bool(false, "Filtre discount/premium",                                         group=GRP_FILTER)
+
+// --- Sessions ---
+use_session   = input.bool(true,  "Filtre session actif",                                            group=GRP_SESSION)
+sess_london   = input.bool(true,  "Londres (07:00-12:00 UTC)",                                       group=GRP_SESSION)
+sess_ny       = input.bool(true,  "New York (12:00-17:00 UTC)",                                      group=GRP_SESSION)
+
+// --- Direction ---
+use_longs  = input.bool(false, "Activer les longs",  group=GRP_RISK,
+     tooltip="Desactive par defaut — longs non profitables sur EURUSD 15M (WR<25% persistant)")
+use_shorts = input.bool(true,  "Activer les shorts", group=GRP_RISK)
+
+// --- Gestion de position ---
+use_breakeven = input.bool(true,  "Break-even a +1R",                                               group=GRP_MGMT)
+use_partial_tp= input.bool(true,  "TP partiel 50% a +1.5R",                                         group=GRP_MGMT)
+use_struct_exit=input.bool(true,  "Exit sur rupture structure (10 bougies)",                         group=GRP_MGMT)
+
+// --- Affichage ---
+show_dashboard    = input.bool(true,  "Dashboard statistiques",                                      group=GRP_DISP)
+show_discount_zone= input.bool(false, "Zones premium/discount",                                      group=GRP_DISP)
+
+// ============================================================
+// SECTION 2 — UTILITAIRES DE BASE
+// ============================================================
+
+pip       = syminfo.mintick * 10
+atr14     = ta.atr(14)
+atr50_avg = ta.sma(atr14, 50)
+
+// Session active (utilise la période courante du graphique)
+in_london = not na(time(timeframe.period, "0700-1200", "UTC"))
+in_ny     = not na(time(timeframe.period, "1200-1700", "UTC"))
+in_session= not use_session or (sess_london and in_london) or (sess_ny and in_ny)
+
+// Filtre ATR volatilité
+atr_ok    = not use_atr_filter or (atr14 >= atr_pct * atr50_avg)
+
+// EMA 200 4H (HTF, sans lookahead)
+ema_htf   = request.security(syminfo.tickerid, "240", ta.ema(close, ema_len_htf), lookahead=barmerge.lookahead_off)
+ema_bull  = not use_ema_filter or (close > ema_htf)
+ema_bear  = not use_ema_filter or (close < ema_htf)
+
+// Confirmation bougie (corps > 50% de la range)
+bull_candle     = close > open and (close - open) > 0.5 * (high - low)
+bear_candle     = close < open and (open - close) > 0.5 * (high - low)
+candle_ok_long  = not use_candle_cf or bull_candle
+candle_ok_short = not use_candle_cf or bear_candle
+
+// ============================================================
+// SECTION 3 — NIVEAUX INSTITUTIONNELS (PDH/PDL, ASR)
+// ============================================================
+
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_off)
+
+var float asr_high = na
+var float asr_low  = na
+
+is_asian       = not na(time(timeframe.period, "0000-0700", "UTC"))
+is_london_open = in_london and not in_london[1]
+
+if is_asian
+    asr_high := na(asr_high) ? high : math.max(asr_high, high)
+    asr_low  := na(asr_low)  ? low  : math.min(asr_low,  low)
+
+if is_london_open
+    asr_high := na
+    asr_low  := na
+
+if show_pdhl and barstate.islast
+    line.new(bar_index - 40, pdh, bar_index, pdh, color=color.new(color.orange, 20), width=1, style=line.style_dashed)
+    line.new(bar_index - 40, pdl, bar_index, pdl, color=color.new(color.orange, 20), width=1, style=line.style_dashed)
+    label.new(bar_index, pdh, "PDH", color=color.new(color.orange, 30), textcolor=color.white, size=size.tiny, style=label.style_label_left)
+    label.new(bar_index, pdl, "PDL", color=color.new(color.orange, 30), textcolor=color.white, size=size.tiny, style=label.style_label_left)
+
+if show_asr and not na(asr_high) and barstate.islast
+    line.new(bar_index - 30, asr_high, bar_index, asr_high, color=color.new(color.purple, 30), width=1, style=line.style_dotted)
+    line.new(bar_index - 30, asr_low,  bar_index, asr_low,  color=color.new(color.purple, 30), width=1, style=line.style_dotted)
+    label.new(bar_index, asr_high, "ASR H", color=color.new(color.purple, 40), textcolor=color.white, size=size.tiny, style=label.style_label_left)
+    label.new(bar_index, asr_low,  "ASR L", color=color.new(color.purple, 40), textcolor=color.white, size=size.tiny, style=label.style_label_left)
+
+// ============================================================
+// SECTION 4 — EQH / EQL (Equal Highs / Equal Lows)
+// ============================================================
+
+tol_price = eq_pip_tol * pip
+
+// Détection EQH : cherche le premier high proche d'un autre dans la fenêtre
+var float eqh_level = na
+var float eql_level = na
+var bool  eqh_found = false
+var bool  eql_found = false
+var bool  eqh_prev  = false
+var bool  eql_prev  = false
+
+eqh_prev := eqh_found
+eql_prev := eql_found
+eqh_found := false
+eql_found := false
+
+for i = 1 to eq_lookback - 1
+    for j = i + 1 to eq_lookback
+        if j > eq_lookback
+            break
+        if math.abs(high[i] - high[j]) <= tol_price
+            if not eqh_found or high[i] > eqh_level
+                eqh_found := true
+                eqh_level := high[i]
+        if math.abs(low[i] - low[j]) <= tol_price
+            if not eql_found or low[i] < eql_level
+                eql_found := true
+                eql_level := low[i]
+
+if show_eqh_eql and barstate.isconfirmed
+    if eqh_found and not eqh_prev
+        line.new(bar_index - eq_lookback, eqh_level, bar_index, eqh_level,
+                 color=color.new(color.red, 20), width=2, style=line.style_dashed)
+        label.new(bar_index, eqh_level, "EQH", color=color.new(color.red, 20),
+                  textcolor=color.white, size=size.tiny, style=label.style_label_down)
+    if eql_found and not eql_prev
+        line.new(bar_index - eq_lookback, eql_level, bar_index, eql_level,
+                 color=color.new(color.green, 20), width=2, style=line.style_dashed)
+        label.new(bar_index, eql_level, "EQL", color=color.new(color.green, 20),
+                  textcolor=color.white, size=size.tiny, style=label.style_label_up)
+
+// ============================================================
+// SECTION 5 — SWEEP DE LIQUIDITÉ
+// ============================================================
+
+recent_high_sw = ta.highest(high, sweep_lookback)[1]
+recent_low_sw  = ta.lowest(low,   sweep_lookback)[1]
+
+tol_sw = 2.0 * pip
+
+// Qualité du sweep
+_sweep_q(is_high) =>
+    lvl = is_high ? recent_high_sw : recent_low_sw
+    q   = 1
+    if is_high
+        if math.abs(lvl - pdh) <= tol_sw * 3
+            q := 3
+        else if not na(asr_high) and math.abs(lvl - asr_high) <= tol_sw * 2
+            q := 2
+    else
+        if math.abs(lvl - pdl) <= tol_sw * 3
+            q := 3
+        else if not na(asr_low) and math.abs(lvl - asr_low) <= tol_sw * 2
+            q := 2
+    q
+
+// Sweep haut : wick dépasse le high récent, clôture en dessous
+sweep_high_raw = high > recent_high_sw and close < recent_high_sw
+// Sweep bas  : wick dépasse le low récent, clôture au dessus
+sweep_low_raw  = low  < recent_low_sw  and close > recent_low_sw
+
+sweep_high = sweep_high_raw and barstate.isconfirmed
+sweep_low  = sweep_low_raw  and barstate.isconfirmed
+
+var float last_sweep_h_px  = na
+var float last_sweep_l_px  = na
+var int   last_sweep_h_bar = na
+var int   last_sweep_l_bar = na
+
+if sweep_high
+    last_sweep_h_px  := recent_high_sw
+    last_sweep_h_bar := bar_index
+    if show_sweeps
+        label.new(bar_index, high, "SWEEP H", color=color.new(color.red, 10),
+                  textcolor=color.white, size=size.tiny, style=label.style_label_down)
+
+if sweep_low
+    last_sweep_l_px  := recent_low_sw
+    last_sweep_l_bar := bar_index
+    if show_sweeps
+        label.new(bar_index, low, "SWEEP L", color=color.new(color.green, 10),
+                  textcolor=color.white, size=size.tiny, style=label.style_label_up)
+
+// ============================================================
+// SECTION 6 — STRUCTURE DE MARCHÉ (BOS / CHoCH)
+// ============================================================
+
+swing_h = ta.pivothigh(high, swing_lookback, swing_lookback)
+swing_l  = ta.pivotlow(low,  swing_lookback, swing_lookback)
+
+var float last_sh = na
+var float last_sl = na
+
+if not na(swing_h)
+    last_sh := swing_h
+if not na(swing_l)
+    last_sl := swing_l
+
+// BOS haussier : close franchit le dernier swing high
+bos_bull = not na(last_sh) and close > last_sh and close[1] <= last_sh[1] and barstate.isconfirmed
+// BOS baissier : close franchit le dernier swing low
+bos_bear = not na(last_sl) and close < last_sl and close[1] >= last_sl[1] and barstate.isconfirmed
+
+// CHoCH : BOS dans la direction opposée au dernier BOS
+var bool trend_bull = false  // true = dernier BOS était haussier
+var bool trend_bear = false
+
+choch_bull = bos_bull and trend_bear
+choch_bear = bos_bear and trend_bull
+
+if bos_bull
+    trend_bull := true
+    trend_bear := false
+if bos_bear
+    trend_bear := true
+    trend_bull := false
+
+// Mémoire récente (fenêtre = struct_lookback * 2)
+var bool had_bos_bull   = false
+var bool had_bos_bear   = false
+var bool had_choch_bull = false
+var bool had_choch_bear = false
+var int  bos_bull_bar   = 0
+var int  bos_bear_bar   = 0
+var int  choch_bull_bar = 0
+var int  choch_bear_bar = 0
+
+if bos_bull
+    had_bos_bull  := true
+    bos_bull_bar  := bar_index
+if bos_bear
+    had_bos_bear  := true
+    bos_bear_bar  := bar_index
+if choch_bull
+    had_choch_bull := true
+    choch_bull_bar := bar_index
+if choch_bear
+    had_choch_bear := true
+    choch_bear_bar := bar_index
+
+window = struct_lookback * 2
+
+bos_bull_ok   = had_bos_bull   and (bar_index - bos_bull_bar)   < window
+bos_bear_ok   = had_bos_bear   and (bar_index - bos_bear_bar)   < window
+choch_bull_ok = had_choch_bull and (bar_index - choch_bull_bar) < window
+choch_bear_ok = had_choch_bear and (bar_index - choch_bear_bar) < window
+sweep_l_ok    = not na(last_sweep_l_bar) and (bar_index - last_sweep_l_bar) < window
+sweep_h_ok    = not na(last_sweep_h_bar) and (bar_index - last_sweep_h_bar) < window
+
+// Affichage BOS / CHoCH
+if show_bos and barstate.isconfirmed
+    if bos_bull and not na(last_sh)
+        line.new(bar_index - 1, last_sh, bar_index, last_sh, color=color.blue, width=2)
+        label.new(bar_index, last_sh, "BOS+", color=color.new(color.blue, 10),
+                  textcolor=color.white, size=size.small, style=label.style_label_down)
+    if bos_bear and not na(last_sl)
+        line.new(bar_index - 1, last_sl, bar_index, last_sl, color=color.red, width=2)
+        label.new(bar_index, last_sl, "BOS-", color=color.new(color.red, 10),
+                  textcolor=color.white, size=size.small, style=label.style_label_up)
+
+if show_choch and barstate.isconfirmed
+    if choch_bull
+        label.new(bar_index, low, "CHoCH+", color=color.new(color.lime, 10),
+                  textcolor=color.black, size=size.small, style=label.style_label_up)
+    if choch_bear
+        label.new(bar_index, high, "CHoCH-", color=color.new(color.orange, 10),
+                  textcolor=color.black, size=size.small, style=label.style_label_down)
+
+// ============================================================
+// SECTION 7 — FVG (Fair Value Gap / Imbalance)
+// ============================================================
+
+// FVG bullish  : gap entre bar[0].low et bar[2].high (bougie centrale = impulsion)
+// FVG bearish  : gap entre bar[2].low et bar[0].high
+fvg_bull_raw = low > high[2] and (high[1] - low[1]) > fvg_atr_mult * atr14
+fvg_bear_raw = high < low[2] and (high[1] - low[1]) > fvg_atr_mult * atr14
+
+// Stockage simplifié des zones actives (sans UDT pour compatibilité max)
+var float[] fvg_bull_top  = array.new_float(0)
+var float[] fvg_bull_bot  = array.new_float(0)
+var bool[]  fvg_bull_live = array.new_bool(0)
+
+var float[] fvg_bear_top  = array.new_float(0)
+var float[] fvg_bear_bot  = array.new_float(0)
+var bool[]  fvg_bear_live = array.new_bool(0)
+
+if fvg_bull_raw and barstate.isconfirmed
+    array.unshift(fvg_bull_top,  low)
+    array.unshift(fvg_bull_bot,  high[2])
+    array.unshift(fvg_bull_live, true)
+    if array.size(fvg_bull_top) > fvg_max_slots
+        array.pop(fvg_bull_top)
+        array.pop(fvg_bull_bot)
+        array.pop(fvg_bull_live)
+
+if fvg_bear_raw and barstate.isconfirmed
+    array.unshift(fvg_bear_top,  low[2])
+    array.unshift(fvg_bear_bot,  high)
+    array.unshift(fvg_bear_live, true)
+    if array.size(fvg_bear_top) > fvg_max_slots
+        array.pop(fvg_bear_top)
+        array.pop(fvg_bear_bot)
+        array.pop(fvg_bear_live)
+
+// Invalider si prix clôture au-delà
+if array.size(fvg_bull_live) > 0
+    for k = 0 to array.size(fvg_bull_live) - 1
+        if array.get(fvg_bull_live, k) and close < array.get(fvg_bull_bot, k)
+            array.set(fvg_bull_live, k, false)
+
+if array.size(fvg_bear_live) > 0
+    for k = 0 to array.size(fvg_bear_live) - 1
+        if array.get(fvg_bear_live, k) and close > array.get(fvg_bear_top, k)
+            array.set(fvg_bear_live, k, false)
+
+// Prix dans une FVG active
+price_in_bull_fvg = false
+if array.size(fvg_bull_live) > 0
+    for k = 0 to array.size(fvg_bull_live) - 1
+        if array.get(fvg_bull_live, k)
+            if low <= array.get(fvg_bull_top, k) and high >= array.get(fvg_bull_bot, k)
+                price_in_bull_fvg := true
+                break
+
+price_in_bear_fvg = false
+if array.size(fvg_bear_live) > 0
+    for k = 0 to array.size(fvg_bear_live) - 1
+        if array.get(fvg_bear_live, k)
+            if low <= array.get(fvg_bear_top, k) and high >= array.get(fvg_bear_bot, k)
+                price_in_bear_fvg := true
+            break
+
+if show_fvg and barstate.isconfirmed
+    if fvg_bull_raw
+        box.new(bar_index - 2, low, bar_index, high[2],
+                bgcolor=color.new(color.green, 80), border_color=color.new(color.green, 50))
+        label.new(bar_index, high[2], "IMB+", color=color.new(color.green, 30),
+                  textcolor=color.white, size=size.tiny, style=label.style_label_down)
+    if fvg_bear_raw
+        box.new(bar_index - 2, low[2], bar_index, high,
+                bgcolor=color.new(color.red, 80), border_color=color.new(color.red, 50))
+        label.new(bar_index, low[2], "IMB-", color=color.new(color.red, 30),
+                  textcolor=color.white, size=size.tiny, style=label.style_label_up)
+
+// ============================================================
+// SECTION 8 — ORDER BLOCKS
+// ============================================================
+
+// OB bullish : dernière bougie bearish avant impulsion bullish (corps ≥ ob_atr_mult × ATR)
+// OB bearish : dernière bougie bullish avant impulsion bearish
+
+bull_impulse_candle = close > open and (high - low) > ob_atr_mult * atr14
+bear_impulse_candle = close < open and (high - low) > ob_atr_mult * atr14
+
+var float[] ob_bull_top  = array.new_float(0)
+var float[] ob_bull_bot  = array.new_float(0)
+var bool[]  ob_bull_live = array.new_bool(0)
+
+var float[] ob_bear_top  = array.new_float(0)
+var float[] ob_bear_bot  = array.new_float(0)
+var bool[]  ob_bear_live = array.new_bool(0)
+
+if bull_impulse_candle and barstate.isconfirmed
+    ob_found_top = float(na)
+    ob_found_bot = float(na)
+    for i = 1 to ob_lookback
+        if close[i] < open[i] and (open[i] - close[i]) > ob_atr_mult * atr14
+            ob_found_top := open[i]
+            ob_found_bot := close[i]
+            break
+    if not na(ob_found_top)
+        array.unshift(ob_bull_top,  ob_found_top)
+        array.unshift(ob_bull_bot,  ob_found_bot)
+        array.unshift(ob_bull_live, true)
+        if array.size(ob_bull_top) > ob_max_slots
+            array.pop(ob_bull_top)
+            array.pop(ob_bull_bot)
+            array.pop(ob_bull_live)
+        if show_ob
+            box.new(bar_index - ob_lookback, ob_found_top, bar_index, ob_found_bot,
+                    bgcolor=color.new(color.aqua, 85), border_color=color.new(color.aqua, 40))
+            label.new(bar_index, ob_found_bot, "OB+", color=color.new(color.aqua, 20),
+                      textcolor=color.black, size=size.tiny, style=label.style_label_up)
+
+if bear_impulse_candle and barstate.isconfirmed
+    ob_found_top = float(na)
+    ob_found_bot = float(na)
+    for i = 1 to ob_lookback
+        if close[i] > open[i] and (close[i] - open[i]) > ob_atr_mult * atr14
+            ob_found_top := close[i]
+            ob_found_bot := open[i]
+            break
+    if not na(ob_found_top)
+        array.unshift(ob_bear_top,  ob_found_top)
+        array.unshift(ob_bear_bot,  ob_found_bot)
+        array.unshift(ob_bear_live, true)
+        if array.size(ob_bear_top) > ob_max_slots
+            array.pop(ob_bear_top)
+            array.pop(ob_bear_bot)
+            array.pop(ob_bear_live)
+        if show_ob
+            box.new(bar_index - ob_lookback, ob_found_top, bar_index, ob_found_bot,
+                    bgcolor=color.new(color.orange, 85), border_color=color.new(color.orange, 40))
+            label.new(bar_index, ob_found_top, "OB-", color=color.new(color.orange, 20),
+                      textcolor=color.white, size=size.tiny, style=label.style_label_down)
+
+// Invalider OB si clôture au-delà
+if array.size(ob_bull_live) > 0
+    for k = 0 to array.size(ob_bull_live) - 1
+        if array.get(ob_bull_live, k) and close < array.get(ob_bull_bot, k)
+            array.set(ob_bull_live, k, false)
+
+if array.size(ob_bear_live) > 0
+    for k = 0 to array.size(ob_bear_live) - 1
+        if array.get(ob_bear_live, k) and close > array.get(ob_bear_top, k)
+            array.set(ob_bear_live, k, false)
+
+price_in_bull_ob = false
+if array.size(ob_bull_live) > 0
+    for k = 0 to array.size(ob_bull_live) - 1
+        if array.get(ob_bull_live, k)
+            if low <= array.get(ob_bull_top, k) and high >= array.get(ob_bull_bot, k)
+                price_in_bull_ob := true
+                break
+
+price_in_bear_ob = false
+if array.size(ob_bear_live) > 0
+    for k = 0 to array.size(ob_bear_live) - 1
+        if array.get(ob_bear_live, k)
+            if low <= array.get(ob_bear_top, k) and high >= array.get(ob_bear_bot, k)
+                price_in_bear_ob := true
+            break
+
+// ============================================================
+// SECTION 9 — ZONES PREMIUM / DISCOUNT
+// ============================================================
+
+range_h   = ta.highest(high, struct_lookback)
+range_l   = ta.lowest(low,   struct_lookback)
+range_mid = (range_h + range_l) / 2.0
+
+in_discount = close < range_mid
+in_premium  = close > range_mid
+
+discount_ok_long  = not use_discount or in_discount
+discount_ok_short = not use_discount or in_premium
+
+if show_discount_zone and barstate.islast
+    box.new(bar_index - struct_lookback, range_mid, bar_index, range_l,
+            bgcolor=color.new(color.green, 93), border_color=color.new(color.white, 100))
+    box.new(bar_index - struct_lookback, range_h,   bar_index, range_mid,
+            bgcolor=color.new(color.red, 93), border_color=color.new(color.white, 100))
+
+// ============================================================
+// SECTION 10 — LOGIQUE DES CONFIRMATIONS (stricte 2 sur 3)
+// ============================================================
+//
+// ARCHITECTURE :
+//   PRÉREQUIS obligatoire : BOS ou CHoCH dans la bonne direction
+//   CONFIRMATIONS : 2 parmi les 3 éléments suivants :
+//     A. Liquidité  — sweep récent OU EQL/EQH OU prix proche PDH/PDL
+//     B. Imbalance  — prix dans un FVG actif
+//     C. Order Block — prix dans un OB actif
+//
+// Combinaisons valides (au moins 1) :
+//   A+B : FVG + Liquidité
+//   A+C : OB  + Liquidité
+//   B+C : OB  + Imbalance (FVG)
+
+// --- Prérequis structurel ---
+struct_bull = bos_bull_ok or choch_bull_ok
+struct_bear = bos_bear_ok or choch_bear_ok
+
+// --- Élément A : Liquidité ---
+near_pdl = not na(pdl) and math.abs(low - pdl) < eq_pip_tol * pip * 3
+near_pdh = not na(pdh) and math.abs(high - pdh) < eq_pip_tol * pip * 3
+
+liq_bull = sweep_l_ok or eql_found or near_pdl    // long  : sweep OU EQL OU near PDL
+liq_bear = sweep_h_ok or eqh_found or near_pdh    // short : sweep OU EQH OU near PDH
+
+// --- Éléments B et C : Imbalance & OB ---
+// price_in_bull_fvg / price_in_bear_fvg  → Imbalance (FVG)
+// price_in_bull_ob  / price_in_bear_ob   → Order Block
+
+// --- Combinaisons LONG (sweep obligatoire pour les paires avec liquidité) ---
+// Même logique que la version 70 trades / WR shorts 35.71%
+// long_confirmed sert aussi de filtre directionnalité pour les shorts
+bull_ab = price_in_bull_fvg and sweep_l_ok        // FVG + Sweep
+bull_ac = price_in_bull_ob  and sweep_l_ok        // OB  + Sweep
+bull_bc = price_in_bull_ob  and price_in_bull_fvg // OB  + Imbalance
+
+long_confirmed = struct_bull and (bull_ab or bull_ac or bull_bc)
+
+// --- Combinaisons SHORT (3 combos possibles) ---
+bear_ab = price_in_bear_fvg and liq_bear          // FVG + Liquidité
+bear_ac = price_in_bear_ob  and liq_bear          // OB  + Liquidité
+bear_bc = price_in_bear_ob  and price_in_bear_fvg // OB  + Imbalance
+
+short_confirmed = struct_bear and (bear_ab or bear_ac or bear_bc)
+
+// ============================================================
+// SECTION 11 — CALCUL SL / TP / SIZING
+// ============================================================
+
+// SL long : référence = sweep low le plus récent ou OB bull bottom
+sl_ref_long = last_sweep_l_px
+if array.size(ob_bull_live) > 0
+    for k = 0 to array.size(ob_bull_live) - 1
+        if array.get(ob_bull_live, k)
+            bot = array.get(ob_bull_bot, k)
+            if na(sl_ref_long) or bot < sl_ref_long
+                sl_ref_long := bot
+
+if na(sl_ref_long)
+    sl_ref_long := close - sl_min_pips * pip
+
+sl_long_raw  = sl_ref_long - 2.0 * pip
+sl_long_pips = (close - sl_long_raw) / pip
+
+// SL short : référence = sweep high le plus récent ou OB bear top
+sl_ref_short = last_sweep_h_px
+if array.size(ob_bear_live) > 0
+    for k = 0 to array.size(ob_bear_live) - 1
+        if array.get(ob_bear_live, k)
+            top = array.get(ob_bear_top, k)
+            if na(sl_ref_short) or top > sl_ref_short
+                sl_ref_short := top
+
+if na(sl_ref_short)
+    sl_ref_short := close + sl_min_pips * pip
+
+sl_short_raw  = sl_ref_short + 2.0 * pip
+sl_short_pips = (sl_short_raw - close) / pip
+
+// Validation SL
+sl_long_valid  = sl_long_pips  >= sl_min_pips and sl_long_pips  <= sl_max_pips
+sl_short_valid = sl_short_pips >= sl_min_pips and sl_short_pips <= sl_max_pips
+
+// TP : vers prochain pool de liquidité, au minimum à RR pips
+_tp_long(entry, sl) =>
+    base = entry + min_rr * (entry - sl)
+    if not na(eqh_level) and eqh_level > base
+        eqh_level
+    else if not na(pdh) and pdh > base
+        pdh
+    else
+        base
+
+_tp_short(entry, sl) =>
+    base = entry - min_rr * (sl - entry)
+    if not na(eql_level) and eql_level < base
+        eql_level
+    else if not na(pdl) and pdl < base
+        pdl
+    else
+        base
+
+tp_long_raw  = _tp_long(close, sl_long_raw)
+tp_short_raw = _tp_short(close, sl_short_raw)
+
+rr_long_real  = sl_long_pips  > 0 ? (tp_long_raw  - close)  / (close - sl_long_raw)  : 0.0
+rr_short_real = sl_short_pips > 0 ? (close - tp_short_raw)  / (sl_short_raw - close) : 0.0
+
+// Sizing dynamique en UNITÉS (TradingView qty = unités, pas des lots)
+// Formule : qty = risk_usd / sl_distance_prix
+// Exemple : SL=10 pips=0.001, risk=50$ → qty = 50/0.001 = 50 000 unités = 0.5 lot
+// P&L vérifié : 50 000 × 0.001 = 50$ ✓   (levier 50:1 via margin_long=2.0)
+sl_dist_long  = math.max(close - sl_long_raw,  sl_min_pips * pip)
+sl_dist_short = math.max(sl_short_raw - close, sl_min_pips * pip)
+qty_long  = math.max(1000.0, math.min(500000.0, math.round(risk_usd / sl_dist_long)))
+qty_short = math.max(1000.0, math.min(500000.0, math.round(risk_usd / sl_dist_short)))
+
+// ============================================================
+// SECTION 12 — CONDITIONS D'ENTRÉE FINALES
+// ============================================================
+
+no_position = strategy.position_size == 0
+
+// SL sanity : long SL doit être sous le close, short SL au-dessus
+sl_long_dir_ok  = sl_long_raw  < close - sl_min_pips * pip
+sl_short_dir_ok = sl_short_raw > close + sl_min_pips * pip
+
+enter_long = use_longs
+     and no_position
+     and barstate.isconfirmed
+     and in_session
+     and atr_ok
+     and long_confirmed
+     and ema_bull
+     and candle_ok_long
+     and discount_ok_long
+     and sl_long_valid
+     and sl_long_dir_ok
+     and rr_long_real >= min_rr
+
+enter_short = use_shorts
+     and no_position
+     and barstate.isconfirmed
+     and in_session
+     and atr_ok
+     and short_confirmed
+     and not long_confirmed         // filtre clarté directionnelle : pas de short si signaux haussiers aussi
+     and ema_bear
+     and candle_ok_short
+     and discount_ok_short
+     and sl_short_valid
+     and sl_short_dir_ok
+     and rr_short_real >= min_rr
+
+// ============================================================
+// SECTION 13 — EXÉCUTION DES ORDRES
+// ============================================================
+
+// Stockage des paramètres à l'entrée (anti-repaint)
+var float entry_sl   = na
+var float entry_tp   = na
+var float entry_tp1  = na  // partial TP à 1.5R
+var bool  be_done    = false
+var bool  tp1_done   = false
+
+if enter_long
+    entry_sl  := sl_long_raw
+    entry_tp  := tp_long_raw
+    entry_tp1 := close + 1.5 * (close - sl_long_raw)
+    be_done   := false
+    tp1_done  := false
+    strategy.entry("Long", strategy.long, qty=qty_long)
+    strategy.exit("Long_exit", from_entry="Long",
+         stop    = sl_long_raw,
+         limit   = tp_long_raw,
+         comment = "TP/SL Long")
+    label.new(bar_index, low,
+              "LONG  RR:" + str.tostring(math.round(rr_long_real, 2)) +
+              "  SL:" + str.tostring(math.round(sl_long_pips, 1)) + "p",
+              color=color.new(color.green, 10), textcolor=color.white,
+              size=size.normal, style=label.style_label_up)
+
+else if enter_short
+    entry_sl  := sl_short_raw
+    entry_tp  := tp_short_raw
+    entry_tp1 := close - 1.5 * (sl_short_raw - close)
+    be_done   := false
+    tp1_done  := false
+    strategy.entry("Short", strategy.short, qty=qty_short)
+    strategy.exit("Short_exit", from_entry="Short",
+         stop    = sl_short_raw,
+         limit   = tp_short_raw,
+         comment = "TP/SL Short")
+    label.new(bar_index, high,
+              "SHORT  RR:" + str.tostring(math.round(rr_short_real, 2)) +
+              "  SL:" + str.tostring(math.round(sl_short_pips, 1)) + "p",
+              color=color.new(color.red, 10), textcolor=color.white,
+              size=size.normal, style=label.style_label_down)
+
+// ============================================================
+// SECTION 14 — GESTION DE POSITION (BE, PARTIAL TP, STRUCT EXIT)
+// ============================================================
+
+is_long_pos  = strategy.position_size > 0
+is_short_pos = strategy.position_size < 0
+avg_px       = strategy.position_avg_price
+
+if (is_long_pos or is_short_pos) and not na(entry_sl) and not na(entry_tp)
+
+    one_r = math.abs(avg_px - entry_sl)
+
+    // --- Break-even à +1R ---
+    if use_breakeven and not be_done
+        if is_long_pos  and close >= avg_px + one_r
+            be_done := true
+            strategy.exit("Long_exit", from_entry="Long",
+                 stop    = avg_px + pip,
+                 limit   = entry_tp,
+                 comment = "BE Long")
+        if is_short_pos and close <= avg_px - one_r
+            be_done := true
+            strategy.exit("Short_exit", from_entry="Short",
+                 stop    = avg_px - pip,
+                 limit   = entry_tp,
+                 comment = "BE Short")
+
+    // --- TP Partiel 50% à +1.5R ---
+    if use_partial_tp and not tp1_done and not na(entry_tp1)
+        if is_long_pos  and close >= entry_tp1
+            tp1_done := true
+            strategy.exit("Long_tp1", from_entry="Long",
+                 qty_percent = 50,
+                 limit       = entry_tp1,
+                 comment     = "TP1 Long 50%")
+        if is_short_pos and close <= entry_tp1
+            tp1_done := true
+            strategy.exit("Short_tp1", from_entry="Short",
+                 qty_percent = 50,
+                 limit       = entry_tp1,
+                 comment     = "TP1 Short 50%")
+
+    // --- Exit sur rupture de structure (10 bougies) ---
+    if use_struct_exit
+        struct_l = ta.lowest(low,   10)[1]
+        struct_h = ta.highest(high, 10)[1]
+        if is_long_pos  and close < struct_l
+            strategy.close("Long",  comment="Struct exit L")
+        if is_short_pos and close > struct_h
+            strategy.close("Short", comment="Struct exit S")
+
+// Reset après fermeture de position
+if no_position
+    entry_sl := na
+    entry_tp := na
+
+// ============================================================
+// SECTION 15 — DASHBOARD STATISTIQUES
+// ============================================================
+
+if show_dashboard
+    total  = strategy.closedtrades
+    wins   = strategy.wintrades
+    losses = strategy.losstrades
+    wr     = total > 0 ? wins / total * 100.0 : 0.0
+    pf     = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : 0.0
+    net    = strategy.netprofit
+    dd     = strategy.max_drawdown
+
+    txt = "SMC v9 Stats\n" +
+          "─────────────\n" +
+          "Trades : " + str.tostring(total)                        + "\n" +
+          "Wins   : " + str.tostring(wins)                         + "\n" +
+          "Losses : " + str.tostring(losses)                       + "\n" +
+          "WR     : " + str.tostring(math.round(wr,   1)) + "%"   + "\n" +
+          "PF     : " + str.tostring(math.round(pf,   2))         + "\n" +
+          "Net    : " + str.tostring(math.round(net,  2)) + "$"   + "\n" +
+          "MaxDD  : " + str.tostring(math.round(dd,   2)) + "$"   + "\n" +
+          "Open   : " + str.tostring(strategy.opentrades) + " pos"
+
+    var table dash = table.new(position.top_right, 1, 1,
+         bgcolor      = color.new(color.black, 10),
+         border_color = color.new(color.gray,  40),
+         border_width = 1)
+    table.cell(dash, 0, 0, txt,
+         text_color = color.white,
+         text_size  = size.small,
+         bgcolor    = color.new(color.black, 15))
+
+// ============================================================
+// SECTION 16 — PLOTS & ALERTES
+// ============================================================
+
+plot(use_ema_filter ? ema_htf : na, "EMA 200 HTF",
+     color=color.new(color.yellow, 30), linewidth=2)
+
+plot(show_discount_zone ? range_mid : na, "Midpoint",
+     color=color.new(color.gray, 50), linewidth=1, style=plot.style_circles)
+
+alertcondition(enter_long,  title="SMC v9 LONG",  message="SMC v9 - LONG {{ticker}} {{interval}}")
+alertcondition(enter_short, title="SMC v9 SHORT", message="SMC v9 - SHORT {{ticker}} {{interval}}")

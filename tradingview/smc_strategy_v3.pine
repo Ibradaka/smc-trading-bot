@@ -1,0 +1,728 @@
+// ============================================================
+// SMC Strategy v3 — ICT / LuxAlgo Inspired
+// Projet   : SMC Trading Bot
+// Version  : 3.0.0
+// ============================================================
+//
+// AMÉLIORATIONS vs V2b :
+//   1. Lot size = 1% equity (vs 0.02 fixe cassé)
+//   2. OB institutionnel : corps > 0.5 ATR, 3 slots/direction
+//   3. Logique entrée complète en 5 étapes (HTF > SWEEP > BOS > ZONE > [BOUGIE])
+//   4. SL priorité sweep low > OB > FVG > fallback, skip si > 30p
+//   5. TP priorité swing > OB bear/bull > RR 2.5, skip si RR < 2.0
+//   6. Filtre zone Discount/Premium (concept ICT)
+//
+// ============================================================
+
+//@version=6
+strategy(
+     title                   = "SMC Strategy v3",
+     shorttitle              = "SMC-S v3",
+     overlay                 = true,
+     initial_capital         = 3000,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 1,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.007,
+     slippage                = 2,
+     process_orders_on_close = true,
+     max_bars_back           = 500,
+     pyramiding              = 0
+ )
+
+// ============================================================
+// SECTION 1 — PARAMÈTRES CONFIGURABLES
+// ============================================================
+
+var string GRP_FILTERS  = "Filtres SMC"
+var string GRP_FVG      = "Fair Value Gap"
+var string GRP_OB       = "Order Block"
+var string GRP_RISK     = "Gestion du risque"
+var string GRP_SWING    = "Swing / Sweep"
+var string GRP_DISCOUNT = "Zone Discount/Premium"
+var string GRP_DISPLAY  = "Affichage"
+
+sweep_lookback = input.int(
+     30, title="Lookback sweep récent (bougies)",
+     minval=5, maxval=60, group=GRP_FILTERS)
+
+bos_lookback = input.int(
+     20, title="Lookback BOS (bougies)",
+     minval=5, maxval=100, group=GRP_FILTERS)
+
+swing_lookback = input.int(
+     10, title="Lookback pivot swing",
+     minval=3, maxval=50, group=GRP_SWING)
+
+sweep_buffer_pips = input.float(
+     2.0, title="Buffer sweep (pips)",
+     minval=0.5, maxval=10.0, step=0.5, group=GRP_SWING)
+
+fvg_atr_mult = input.float(
+     1.5, title="Multiplicateur ATR impulsion FVG",
+     minval=0.5, maxval=5.0, step=0.1, group=GRP_FVG)
+
+ob_lookback = input.int(
+     15, title="Lookback Order Block (bougies)",
+     minval=3, maxval=40, group=GRP_OB)
+
+ob_body_atr_mult = input.float(
+     0.5, title="Corps OB minimum (x ATR)",
+     minval=0.1, maxval=2.0, step=0.1, group=GRP_OB,
+     tooltip="Corps de la bougie OB doit être > ce multiplicateur × ATR(14)")
+
+min_rr = input.float(
+     2.0, title="RR minimum",
+     minval=1.0, maxval=5.0, step=0.1, group=GRP_RISK)
+
+sl_min_pips = input.float(
+     10.0, title="SL minimum (pips)",
+     minval=5.0, maxval=30.0, step=1.0, group=GRP_RISK)
+
+sl_max_pips = input.float(
+     30.0, title="SL maximum (pips)",
+     minval=10.0, maxval=60.0, step=1.0, group=GRP_RISK)
+
+use_candle_confirm = input.bool(
+     false, title="Confirmation bougie (engulf/pinbar)",
+     group=GRP_RISK,
+     tooltip="Si activé : corps fort > 60% bougie OU mèche basse > 1.5x corps")
+
+discount_period = input.int(
+     50, title="Période range Discount/Premium",
+     minval=20, maxval=200, group=GRP_DISCOUNT)
+
+use_discount_filter = input.bool(
+     true, title="Activer filtre Discount/Premium",
+     group=GRP_DISCOUNT,
+     tooltip="LONG uniquement en zone Discount, SHORT uniquement en zone Premium")
+
+show_ema       = input.bool(true, title="EMA 50 (4H)",          group=GRP_DISPLAY)
+show_swings    = input.bool(true, title="Niveaux swing",         group=GRP_DISPLAY)
+show_fvg       = input.bool(true, title="Zones FVG",            group=GRP_DISPLAY)
+show_ob        = input.bool(true, title="Zones Order Block",     group=GRP_DISPLAY)
+show_discount  = input.bool(true, title="Zones Discount/Premium",group=GRP_DISPLAY)
+show_bos_lines = input.bool(true, title="Lignes BOS",            group=GRP_DISPLAY)
+show_labels    = input.bool(true, title="Labels signaux",        group=GRP_DISPLAY)
+show_table     = input.bool(true, title="Tableau récapitulatif", group=GRP_DISPLAY)
+
+// ============================================================
+// SECTION 2 — UTILITAIRES
+// ============================================================
+
+PIP = syminfo.mintick * 10
+
+f_pips_to_price(pips) =>
+    pips * PIP
+
+f_price_to_pips(price_diff) =>
+    math.round(math.abs(price_diff) / PIP, 1)
+
+f_clamp(val, lo, hi) =>
+    math.max(lo, math.min(hi, val))
+
+f_in_session() =>
+    h             = hour(time, "UTC")
+    m             = minute(time, "UTC")
+    total_minutes = h * 60 + m
+    london        = total_minutes >= 8 * 60       and total_minutes < 11 * 60
+    ny            = total_minutes >= 14 * 60 + 30 and total_minutes < 17 * 60
+    london or ny
+
+// ============================================================
+// SECTION 3 — EMA 50 4H + BIAIS DAILY
+// ============================================================
+
+ema_50_4h = request.security(
+     syminfo.tickerid, "240",
+     ta.ema(close, 50),
+     lookahead=barmerge.lookahead_off
+ )
+
+close_daily  = request.security(syminfo.tickerid, "D", close,             lookahead=barmerge.lookahead_off)
+ema_50_daily = request.security(syminfo.tickerid, "D", ta.ema(close, 50), lookahead=barmerge.lookahead_off)
+
+daily_bias_bull = close_daily > ema_50_daily
+daily_bias_bear = close_daily < ema_50_daily
+
+plot(show_ema ? ema_50_4h : na,
+     title="EMA 50 (4H)", color=color.new(color.orange, 0), linewidth=2)
+
+if barstate.islast
+    label.new(bar_index, ta.highest(high, 10),
+         text      = daily_bias_bull ? "BIAS D: BULL" : "BIAS D: BEAR",
+         style     = label.style_label_left,
+         color     = daily_bias_bull ? color.new(color.green, 10) : color.new(color.red, 10),
+         textcolor = color.white,
+         size      = size.normal)
+
+// ============================================================
+// SECTION 4 — ZONE DISCOUNT / PREMIUM (ICT)
+// ============================================================
+
+range_high = ta.highest(high, discount_period)
+range_low  = ta.lowest(low,  discount_period)
+midpoint   = (range_high + range_low) / 2.0
+
+in_discount = close < midpoint
+in_premium  = close > midpoint
+
+if show_discount and barstate.islast
+    bgcolor_disc = color.new(color.green, 93)
+    bgcolor_prem = color.new(color.red,   93)
+    box.new(bar_index - discount_period, range_low, bar_index + 5, midpoint,
+         border_color=color.new(color.green, 80), bgcolor=bgcolor_disc, border_width=1)
+    box.new(bar_index - discount_period, midpoint, bar_index + 5, range_high,
+         border_color=color.new(color.red, 80), bgcolor=bgcolor_prem, border_width=1)
+
+// ============================================================
+// SECTION 5 — SWING HIGHS / LOWS
+// ============================================================
+
+atr_14 = ta.atr(14)
+
+raw_swing_high = ta.pivothigh(high, swing_lookback, swing_lookback)
+raw_swing_low  = ta.pivotlow(low,   swing_lookback, swing_lookback)
+
+var float last_swing_high = na
+var float last_swing_low  = na
+
+if not na(raw_swing_high)
+    last_swing_high := raw_swing_high
+if not na(raw_swing_low)
+    last_swing_low := raw_swing_low
+
+if show_swings and not na(raw_swing_high)
+    line.new(bar_index - swing_lookback, raw_swing_high, bar_index, raw_swing_high,
+         color=color.new(color.red, 50), style=line.style_dotted, width=1)
+
+if show_swings and not na(raw_swing_low)
+    line.new(bar_index - swing_lookback, raw_swing_low, bar_index, raw_swing_low,
+         color=color.new(color.green, 50), style=line.style_dotted, width=1)
+
+// ============================================================
+// SECTION 6 — SWEEP HIGH / SWEEP LOW
+// ============================================================
+
+sweep_buffer = f_pips_to_price(sweep_buffer_pips)
+
+sweep_high_cond = not na(last_swing_high)
+     and high  > last_swing_high + sweep_buffer
+     and close < last_swing_high
+     and close < open
+     and daily_bias_bear
+
+sweep_low_cond = not na(last_swing_low)
+     and low   < last_swing_low - sweep_buffer
+     and close > last_swing_low
+     and close > open
+     and daily_bias_bull
+
+var float last_sweep_low_price  = na
+var float last_sweep_high_price = na
+
+if sweep_low_cond
+    last_sweep_low_price  := low
+if sweep_high_cond
+    last_sweep_high_price := high
+
+sweep_low_recent  = ta.barssince(sweep_low_cond)  <= sweep_lookback
+sweep_high_recent = ta.barssince(sweep_high_cond) <= sweep_lookback
+
+// ============================================================
+// SECTION 7 — BREAK OF STRUCTURE (BOS)
+// ============================================================
+
+bos_ref_high = ta.highest(high, bos_lookback)[1]
+bos_ref_low  = ta.lowest(low,  bos_lookback)[1]
+
+bos_bull_cond = close > bos_ref_high
+     and close[1] <= bos_ref_high
+     and not sweep_low_cond
+     and daily_bias_bull
+
+bos_bear_cond = close < bos_ref_low
+     and close[1] >= bos_ref_low
+     and not sweep_high_cond
+     and daily_bias_bear
+
+if bos_bull_cond and show_bos_lines
+    line.new(bar_index - 1, bos_ref_high, bar_index, bos_ref_high,
+         color=color.new(color.blue, 20), style=line.style_dashed, width=2)
+    if show_labels
+        label.new(bar_index, low, text="BOS +",
+             style=label.style_label_up,
+             color=color.new(color.blue, 10), textcolor=color.white, size=size.small)
+
+if bos_bear_cond and show_bos_lines
+    line.new(bar_index - 1, bos_ref_low, bar_index, bos_ref_low,
+         color=color.new(color.purple, 20), style=line.style_dashed, width=2)
+    if show_labels
+        label.new(bar_index, high, text="BOS -",
+             style=label.style_label_down,
+             color=color.new(color.purple, 10), textcolor=color.white, size=size.small)
+
+// ============================================================
+// SECTION 8 — FAIR VALUE GAP (FVG)
+// ============================================================
+
+fvg_impulse  = (high[1] - low[1]) > fvg_atr_mult * atr_14
+fvg_bull_new = fvg_impulse and high[2] < low[0]
+fvg_bear_new = fvg_impulse and low[2]  > high[0]
+
+var float[] fvg_bull_top = array.new_float(3, na)
+var float[] fvg_bull_bot = array.new_float(3, na)
+var float[] fvg_bear_top = array.new_float(3, na)
+var float[] fvg_bear_bot = array.new_float(3, na)
+
+if fvg_bull_new
+    array.set(fvg_bull_top, 2, array.get(fvg_bull_top, 1))
+    array.set(fvg_bull_bot, 2, array.get(fvg_bull_bot, 1))
+    array.set(fvg_bull_top, 1, array.get(fvg_bull_top, 0))
+    array.set(fvg_bull_bot, 1, array.get(fvg_bull_bot, 0))
+    array.set(fvg_bull_top, 0, low[0])
+    array.set(fvg_bull_bot, 0, high[2])
+
+if fvg_bear_new
+    array.set(fvg_bear_top, 2, array.get(fvg_bear_top, 1))
+    array.set(fvg_bear_bot, 2, array.get(fvg_bear_bot, 1))
+    array.set(fvg_bear_top, 1, array.get(fvg_bear_top, 0))
+    array.set(fvg_bear_bot, 1, array.get(fvg_bear_bot, 0))
+    array.set(fvg_bear_top, 0, low[2])
+    array.set(fvg_bear_bot, 0, high[0])
+
+// Invalider FVG traversé complètement
+for i = 0 to 2
+    bt = array.get(fvg_bull_top, i)
+    bb = array.get(fvg_bull_bot, i)
+    if not na(bt) and not na(bb) and close < bb
+        array.set(fvg_bull_top, i, na)
+        array.set(fvg_bull_bot, i, na)
+
+    bt2 = array.get(fvg_bear_top, i)
+    bb2 = array.get(fvg_bear_bot, i)
+    if not na(bt2) and not na(bb2) and close > bt2
+        array.set(fvg_bear_top, i, na)
+        array.set(fvg_bear_bot, i, na)
+
+f_price_in_bull_fvg(p) =>
+    result = false
+    for i = 0 to 2
+        bt = array.get(fvg_bull_top, i)
+        bb = array.get(fvg_bull_bot, i)
+        if not na(bt) and not na(bb) and p >= bb and p <= bt
+            result := true
+    result
+
+f_price_in_bear_fvg(p) =>
+    result = false
+    for i = 0 to 2
+        bt = array.get(fvg_bear_top, i)
+        bb = array.get(fvg_bear_bot, i)
+        if not na(bt) and not na(bb) and p >= bb and p <= bt
+            result := true
+    result
+
+f_bull_fvg_bot() =>
+    result = float(na)
+    for i = 0 to 2
+        bb = array.get(fvg_bull_bot, i)
+        if not na(bb) and na(result)
+            result := bb
+    result
+
+f_bear_fvg_top() =>
+    result = float(na)
+    for i = 0 to 2
+        bt = array.get(fvg_bear_top, i)
+        if not na(bt) and na(result)
+            result := bt
+    result
+
+if show_fvg and fvg_bull_new
+    box.new(bar_index - 2, low[0], bar_index + 20, high[2],
+         border_color=color.new(color.blue, 60), bgcolor=color.new(color.blue, 80), border_width=1)
+    if show_labels
+        label.new(bar_index, (low[0] + high[2]) / 2, text="FVG",
+             style=label.style_none, textcolor=color.new(color.blue, 20), size=size.tiny)
+
+if show_fvg and fvg_bear_new
+    box.new(bar_index - 2, low[2], bar_index + 20, high[0],
+         border_color=color.new(color.orange, 60), bgcolor=color.new(color.orange, 80), border_width=1)
+    if show_labels
+        label.new(bar_index, (low[2] + high[0]) / 2, text="FVG",
+             style=label.style_none, textcolor=color.new(color.orange, 20), size=size.tiny)
+
+// ============================================================
+// SECTION 9 — ORDER BLOCK INSTITUTIONNEL
+// ============================================================
+// Critère OB valide : corps de la bougie > ob_body_atr_mult × ATR(14)
+
+var float[] ob_bull_top = array.new_float(3, na)
+var float[] ob_bull_bot = array.new_float(3, na)
+var float[] ob_bear_top = array.new_float(3, na)
+var float[] ob_bear_bot = array.new_float(3, na)
+
+f_last_bear_candle_institutional() =>
+    o_val = float(na)
+    c_val = float(na)
+    for i = 1 to ob_lookback
+        body = math.abs(close[i] - open[i])
+        if close[i] < open[i] and body > ob_body_atr_mult * atr_14[i]
+            o_val := open[i]
+            c_val := close[i]
+            break
+    [o_val, c_val]
+
+f_last_bull_candle_institutional() =>
+    o_val = float(na)
+    c_val = float(na)
+    for i = 1 to ob_lookback
+        body = math.abs(close[i] - open[i])
+        if close[i] > open[i] and body > ob_body_atr_mult * atr_14[i]
+            o_val := open[i]
+            c_val := close[i]
+            break
+    [o_val, c_val]
+
+if bos_bull_cond
+    [ob_open, ob_close] = f_last_bear_candle_institutional()
+    if not na(ob_open) and not na(ob_close)
+        array.set(ob_bull_top, 2, array.get(ob_bull_top, 1))
+        array.set(ob_bull_bot, 2, array.get(ob_bull_bot, 1))
+        array.set(ob_bull_top, 1, array.get(ob_bull_top, 0))
+        array.set(ob_bull_bot, 1, array.get(ob_bull_bot, 0))
+        array.set(ob_bull_top, 0, ob_open)
+        array.set(ob_bull_bot, 0, ob_close)
+
+if bos_bear_cond
+    [ob_open, ob_close] = f_last_bull_candle_institutional()
+    if not na(ob_open) and not na(ob_close)
+        array.set(ob_bear_top, 2, array.get(ob_bear_top, 1))
+        array.set(ob_bear_bot, 2, array.get(ob_bear_bot, 1))
+        array.set(ob_bear_top, 1, array.get(ob_bear_top, 0))
+        array.set(ob_bear_bot, 1, array.get(ob_bear_bot, 0))
+        array.set(ob_bear_top, 0, ob_close)
+        array.set(ob_bear_bot, 0, ob_open)
+
+// Invalider OB si prix clôture dedans dans la mauvaise direction
+for i = 0 to 2
+    bt = array.get(ob_bull_top, i)
+    bb = array.get(ob_bull_bot, i)
+    if not na(bt) and not na(bb) and close < bb
+        array.set(ob_bull_top, i, na)
+        array.set(ob_bull_bot, i, na)
+
+    bt2 = array.get(ob_bear_top, i)
+    bb2 = array.get(ob_bear_bot, i)
+    if not na(bt2) and not na(bb2) and close > bt2
+        array.set(ob_bear_top, i, na)
+        array.set(ob_bear_bot, i, na)
+
+f_price_in_bull_ob(p) =>
+    result = false
+    for i = 0 to 2
+        bt = array.get(ob_bull_top, i)
+        bb = array.get(ob_bull_bot, i)
+        if not na(bt) and not na(bb) and p >= bb and p <= bt
+            result := true
+    result
+
+f_price_in_bear_ob(p) =>
+    result = false
+    for i = 0 to 2
+        bt = array.get(ob_bear_top, i)
+        bb = array.get(ob_bear_bot, i)
+        if not na(bt) and not na(bb) and p >= bb and p <= bt
+            result := true
+    result
+
+f_bull_ob_bot() =>
+    result = float(na)
+    for i = 0 to 2
+        bb = array.get(ob_bull_bot, i)
+        if not na(bb) and na(result)
+            result := bb
+    result
+
+f_bear_ob_top() =>
+    result = float(na)
+    for i = 0 to 2
+        bt = array.get(ob_bear_top, i)
+        if not na(bt) and na(result)
+            result := bt
+    result
+
+if show_ob and bos_bull_cond
+    ob_t = array.get(ob_bull_top, 0)
+    ob_b = array.get(ob_bull_bot, 0)
+    if not na(ob_t) and not na(ob_b)
+        box.new(bar_index - ob_lookback, ob_t, bar_index + 30, ob_b,
+             border_color=color.new(color.green, 40), bgcolor=color.new(color.green, 75), border_width=1)
+        if show_labels
+            label.new(bar_index, (ob_t + ob_b) / 2, text="OB",
+                 style=label.style_none, textcolor=color.new(color.green, 20), size=size.tiny)
+
+if show_ob and bos_bear_cond
+    ob_t = array.get(ob_bear_top, 0)
+    ob_b = array.get(ob_bear_bot, 0)
+    if not na(ob_t) and not na(ob_b)
+        box.new(bar_index - ob_lookback, ob_t, bar_index + 30, ob_b,
+             border_color=color.new(color.red, 40), bgcolor=color.new(color.red, 75), border_width=1)
+        if show_labels
+            label.new(bar_index, (ob_t + ob_b) / 2, text="OB",
+                 style=label.style_none, textcolor=color.new(color.red, 20), size=size.tiny)
+
+// ============================================================
+// SECTION 10 — CONFIRMATION BOUGIE (optionnel)
+// ============================================================
+// Corps fort > 60% de la bougie OU mèche basse > 1.5x corps (pinbar)
+
+candle_body   = math.abs(close - open)
+candle_range  = high - low
+candle_lower_wick = math.min(close, open) - low
+candle_upper_wick = high - math.max(close, open)
+
+strong_bull_close = candle_range > 0 and (close - low) / candle_range > 0.6
+pinbar_bull       = candle_body > 0 and candle_lower_wick > 1.5 * candle_body and close > open
+
+strong_bear_close = candle_range > 0 and (high - close) / candle_range > 0.6
+pinbar_bear       = candle_body > 0 and candle_upper_wick > 1.5 * candle_body and close < open
+
+candle_ok_long  = not use_candle_confirm or (strong_bull_close or pinbar_bull)
+candle_ok_short = not use_candle_confirm or (strong_bear_close or pinbar_bear)
+
+// ============================================================
+// SECTION 11 — SIGNAUX D'ENTRÉE V3 (5 ÉTAPES)
+// ============================================================
+
+in_session   = f_in_session()
+in_bull_zone = f_price_in_bull_fvg(close) or f_price_in_bull_ob(close)
+in_bear_zone = f_price_in_bear_fvg(close) or f_price_in_bear_ob(close)
+
+// Filtre Discount/Premium
+discount_ok_long  = not use_discount_filter or in_discount
+discount_ok_short = not use_discount_filter or in_premium
+
+// LONG — 5 étapes :
+// 1. Contexte HTF : Daily BULL + prix > EMA 50 4H + session active
+// 2. Sweep liquidité : SWEEP_LOW dans sweep_lookback bougies
+// 3. Confirmation structure : BOS_BULL après le sweep
+// 4. Zone entrée : FVG haussier OU OB haussier (une seule suffit)
+//    + filtre zone Discount (optionnel)
+// 5. Confirmation bougie (optionnel)
+long_signal = sweep_low_recent
+     and ta.barssince(bos_bull_cond) <= sweep_lookback
+     and in_bull_zone
+     and discount_ok_long
+     and candle_ok_long
+     and in_session
+     and close > ema_50_4h
+     and daily_bias_bull
+     and strategy.position_size == 0
+
+// SHORT — symétrique
+short_signal = sweep_high_recent
+     and ta.barssince(bos_bear_cond) <= sweep_lookback
+     and in_bear_zone
+     and discount_ok_short
+     and candle_ok_short
+     and in_session
+     and close < ema_50_4h
+     and daily_bias_bear
+     and strategy.position_size == 0
+
+// ============================================================
+// SECTION 12 — SL DYNAMIQUE INTELLIGENT
+// ============================================================
+// Priorité : 1. sous sweep low  2. sous OB  3. sous FVG  4. fallback 20p
+// Skip si SL > sl_max_pips
+
+f_sl_long() =>
+    ob_bot  = f_bull_ob_bot()
+    fvg_bot = f_bull_fvg_bot()
+    sl_raw  = float(na)
+    if not na(last_sweep_low_price)
+        sl_raw := last_sweep_low_price - f_pips_to_price(2.0)
+    else if not na(ob_bot)
+        sl_raw := ob_bot - f_pips_to_price(2.0)
+    else if not na(fvg_bot)
+        sl_raw := fvg_bot - f_pips_to_price(2.0)
+    else
+        sl_raw := close - f_pips_to_price(20.0)
+    sl_pips_calc    = f_price_to_pips(close - sl_raw)
+    sl_pips_clamped = f_clamp(sl_pips_calc, sl_min_pips, sl_max_pips)
+    close - f_pips_to_price(sl_pips_clamped)
+
+f_sl_short() =>
+    ob_top  = f_bear_ob_top()
+    fvg_top = f_bear_fvg_top()
+    sl_raw  = float(na)
+    if not na(last_sweep_high_price)
+        sl_raw := last_sweep_high_price + f_pips_to_price(2.0)
+    else if not na(ob_top)
+        sl_raw := ob_top + f_pips_to_price(2.0)
+    else if not na(fvg_top)
+        sl_raw := fvg_top + f_pips_to_price(2.0)
+    else
+        sl_raw := close + f_pips_to_price(20.0)
+    sl_pips_calc    = f_price_to_pips(sl_raw - close)
+    sl_pips_clamped = f_clamp(sl_pips_calc, sl_min_pips, sl_max_pips)
+    close + f_pips_to_price(sl_pips_clamped)
+
+// ============================================================
+// SECTION 13 — TP INTELLIGENT
+// ============================================================
+// Priorité : 1. prochain swing high  2. OB bear au-dessus  3. FVG bear au-dessus
+//            4. fallback RR × 2.5
+// Skip si RR calculé < min_rr
+
+f_tp_long(sl_price) =>
+    sl_dist = close - sl_price
+    tp_rr   = close + sl_dist * math.max(min_rr, 2.5)
+    // Prochain swing high significatif au-dessus (RR > 2.0)
+    next_pivot = ta.pivothigh(high, swing_lookback, 0)
+    tp_pivot   = not na(next_pivot) and next_pivot > close + sl_dist * 2.0 ? next_pivot : float(na)
+    // OB bear au-dessus comme résistance
+    ob_res = f_bear_ob_top()
+    tp_ob  = not na(ob_res) and ob_res > close + sl_dist * 2.0 ? ob_res : float(na)
+    // Sélection : pivot d'abord, puis OB, puis RR
+    if not na(tp_pivot)
+        tp_pivot
+    else if not na(tp_ob)
+        tp_ob
+    else
+        tp_rr
+
+f_tp_short(sl_price) =>
+    sl_dist = sl_price - close
+    tp_rr   = close - sl_dist * math.max(min_rr, 2.5)
+    // Prochain swing low significatif en dessous (RR > 2.0)
+    next_pivot = ta.pivotlow(low, swing_lookback, 0)
+    tp_pivot   = not na(next_pivot) and next_pivot < close - sl_dist * 2.0 ? next_pivot : float(na)
+    // OB bull en dessous comme support
+    ob_sup = f_bull_ob_bot()
+    tp_ob  = not na(ob_sup) and ob_sup < close - sl_dist * 2.0 ? ob_sup : float(na)
+    if not na(tp_pivot)
+        tp_pivot
+    else if not na(tp_ob)
+        tp_ob
+    else
+        tp_rr
+
+// ============================================================
+// SECTION 14 — ENTRÉES / SORTIES STRATEGY
+// ============================================================
+
+sl_long_price  = f_sl_long()
+sl_short_price = f_sl_short()
+
+sl_long_pips  = f_price_to_pips(close - sl_long_price)
+sl_short_pips = f_price_to_pips(sl_short_price - close)
+
+// Vérification SL dans les bornes (skip si hors limites)
+sl_long_ok  = sl_long_pips  >= sl_min_pips and sl_long_pips  <= sl_max_pips
+sl_short_ok = sl_short_pips >= sl_min_pips and sl_short_pips <= sl_max_pips
+
+// Vérification RR minimum
+tp_long_price  = f_tp_long(sl_long_price)
+tp_short_price = f_tp_short(sl_short_price)
+
+rr_long  = sl_long_pips  > 0 ? f_price_to_pips(tp_long_price  - close)        / sl_long_pips  : 0.0
+rr_short = sl_short_pips > 0 ? f_price_to_pips(close - tp_short_price)         / sl_short_pips : 0.0
+
+rr_long_ok  = rr_long  >= min_rr
+rr_short_ok = rr_short >= min_rr
+
+if long_signal and sl_long_ok and rr_long_ok
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long TP/SL", from_entry="Long",
+         stop=sl_long_price, limit=tp_long_price)
+    if show_labels
+        label.new(bar_index, low,
+             text  = "L  SL:" + str.tostring(math.round(sl_long_pips, 1)) + "p  RR:" + str.tostring(math.round(rr_long, 1)),
+             style = label.style_label_up,
+             color = color.new(color.teal, 10), textcolor=color.white, size=size.tiny)
+
+if short_signal and sl_short_ok and rr_short_ok
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short TP/SL", from_entry="Short",
+         stop=sl_short_price, limit=tp_short_price)
+    if show_labels
+        label.new(bar_index, high,
+             text  = "S  SL:" + str.tostring(math.round(sl_short_pips, 1)) + "p  RR:" + str.tostring(math.round(rr_short, 1)),
+             style = label.style_label_down,
+             color = color.new(color.maroon, 10), textcolor=color.white, size=size.tiny)
+
+// ============================================================
+// SECTION 15 — TABLEAU RÉCAPITULATIF
+// ============================================================
+
+var table stats_table = table.new(
+     position.top_right, 2, 8,
+     bgcolor      = color.new(color.black, 20),
+     border_width = 1,
+     border_color = color.new(color.gray, 50)
+ )
+
+if barstate.islast and show_table
+    total_trades  = strategy.closedtrades
+    winning       = strategy.wintrades
+    winrate       = total_trades > 0 ? math.round(winning / total_trades * 100, 1) : 0.0
+    gross_profit  = strategy.grossprofit
+    gross_loss    = math.abs(strategy.grossloss)
+    profit_factor = gross_loss > 0 ? math.round(gross_profit / gross_loss, 2) : 0.0
+    net_pnl       = strategy.netprofit
+    avg_win       = winning > 0 ? gross_profit / winning : 0.0
+    avg_loss      = (total_trades - winning) > 0 ? gross_loss / (total_trades - winning) : 1.0
+    rr_real       = avg_loss > 0 ? math.round(avg_win / avg_loss, 2) : 0.0
+    max_dd        = math.round(strategy.max_drawdown / strategy.initial_capital * 100, 1)
+
+    table.cell(stats_table, 0, 0, "SMC Strategy v3",
+         text_color=color.white, text_halign=text.align_left,
+         bgcolor=color.new(color.navy, 20), text_size=size.small)
+    table.cell(stats_table, 1, 0, "ICT / LuxAlgo",
+         text_color=color.white, text_halign=text.align_right,
+         bgcolor=color.new(color.navy, 20), text_size=size.small)
+
+    table.cell(stats_table, 0, 1, "Trades",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 1, str.tostring(total_trades),
+         text_color=total_trades >= 30 ? color.green : color.yellow,
+         text_halign=text.align_right, text_size=size.small)
+
+    table.cell(stats_table, 0, 2, "Winrate",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 2, str.tostring(winrate) + " %",
+         text_color=winrate >= 42 ? color.green : color.red,
+         text_halign=text.align_right, text_size=size.small)
+
+    table.cell(stats_table, 0, 3, "Profit Factor",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 3, str.tostring(profit_factor),
+         text_color=profit_factor >= 1.2 ? color.green : profit_factor >= 1.0 ? color.yellow : color.red,
+         text_halign=text.align_right, text_size=size.small)
+
+    table.cell(stats_table, 0, 4, "RR Moyen",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 4, "1:" + str.tostring(rr_real),
+         text_color=rr_real >= 2.0 ? color.green : color.yellow,
+         text_halign=text.align_right, text_size=size.small)
+
+    table.cell(stats_table, 0, 5, "Net PnL",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 5, str.tostring(math.round(net_pnl, 2)) + " $",
+         text_color=net_pnl >= 0 ? color.green : color.red,
+         text_halign=text.align_right, text_size=size.small)
+
+    table.cell(stats_table, 0, 6, "Max Drawdown",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 6, str.tostring(max_dd) + " %",
+         text_color=max_dd <= 15 ? color.green : max_dd <= 25 ? color.yellow : color.red,
+         text_halign=text.align_right, text_size=size.small)
+
+    table.cell(stats_table, 0, 7, "Biais Daily",
+         text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(stats_table, 1, 7, daily_bias_bull ? "BULL" : "BEAR",
+         text_color=daily_bias_bull ? color.green : color.red,
+         text_halign=text.align_right, text_size=size.small)
