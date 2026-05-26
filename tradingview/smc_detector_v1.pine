@@ -1,14 +1,41 @@
 // ============================================================
 // SMC Detector v1 — Smart Money Concepts Signal Emitter
 // Projet   : SMC Trading Bot
-// Pipeline : TradingView → Webhook → FastAPI → PineConnector → MT5 → AXI
-// Version  : 1.0.0
-// Auteur   : À remplir
+// Version  : 1.2.0
+// Auteur   : Ibradaka
 // ============================================================
 //
-// RÔLE : Ce script est uniquement un capteur de structures.
-//        Il ne prend AUCUNE décision de trading.
-//        Chaque signal est envoyé brut au bot Python qui filtre et décide.
+// ⚠️ STATUT : LEGACY / REFERENCE (maj 2026-05-26)
+//   Ce détecteur est l'ANCÊTRE CONCEPTUEL du système actuel. Il SÉPARE
+//   proprement la détection (Pine = capteur) de la décision (bot Python).
+//
+//   En production aujourd'hui, les 4 stratégies font les DEUX :
+//     - smc_strategy_v13_gold.pine   (XAUUSDs, longs+shorts)
+//     - smc_strategy_v10.pine        (EURUSDs, shorts only)
+//     - smc_strategy_v13_nasdaq.pine (USTECs, shorts only, v13.1)
+//     - smc_strategy_v15_oil.pine    (WTIs, longs+shorts, v15.1)
+//
+//   → Le détecteur N'EST PLUS BRANCHÉ AU BOT. Aucune alerte production
+//     ne pointe sur ce script depuis le 22 mai 2026.
+//
+//   GARDÉ POUR :
+//   - Référence pédagogique : architecture modulaire détection / décision
+//   - Historique : montre l'évolution du projet vers les stratégies intégrées
+//   - Outil de visualisation : peut être remis sur un chart pour voir les
+//     structures SMC (BOS, sweeps, CHoCH, range) sans logique de trading
+//
+// Pipeline ACTUEL (la mention « PineConnector → AXI » historique du header
+// d'origine est OBSOLÈTE depuis le 21 mai 2026) :
+//   TradingView (stratégies) → Webhook FastAPI → mt5_forwarder
+//                            → mt5_executor (Python MetaTrader5)
+//                            → MetaTrader 5 → Switch Markets
+//
+// ============================================================
+//
+// RÔLE (conception originelle, conservé pour clarté) :
+//   Ce script est uniquement un capteur de structures.
+//   Il ne prend AUCUNE décision de trading.
+//   Chaque signal est envoyé brut au bot Python qui filtre et décide.
 //
 // UTILISATION :
 //   1. Coller ce script dans TradingView (Pine Editor)
@@ -20,8 +47,8 @@
 // ÉVÉNEMENTS ÉMIS :
 //   - SWEEP_HIGH    : balayage de liquidité haussière → signal bear
 //   - SWEEP_LOW     : balayage de liquidité baissière → signal bull
-//   - BOS_BULL      : break of structure haussier
-//   - BOS_BEAR      : break of structure baissier
+//   - BOS_BULL      : break of structure haussier (longs)
+//   - CHOCH_BEAR    : change of character baissier — sweep + cassure (shorts, logique V7)
 //   - SESSION_OPEN  : ouverture London ou NY (gestion interne bot)
 //   - RANGE_BREAKOUT: cassure de zone de consolidation
 //
@@ -74,6 +101,11 @@ bos_lookback = input.int(
      20, title="Lookback BOS (bougies)",
      minval=5, maxval=100, group=GRP_BOS,
      tooltip="Fenêtre de recherche du swing high/low de référence pour le BOS")
+
+min_sweep_quality = input.int(
+     1, title="Qualité sweep minimum (1=swing 2=ASR 3=PDH/PDL)",
+     minval=1, maxval=3, group=GRP_BOS,
+     tooltip="V7 : assoupli à 1 — accepte les sweeps de swing génériques. Le détecteur supporte uniquement le niveau 1 (swing).")
 
 // Range
 range_bars = input.int(
@@ -140,22 +172,12 @@ f_price_to_pips(price_diff) =>
 f_timestamp() =>
     str.format_time(timenow, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
 
-// Session active : retourne "london", "ny" ou "none"
-// Heures UTC : London 08:00-11:00 / NY 14:30-17:00
-f_session() =>
-    h = hour(timenow, "UTC")
-    m = minute(timenow, "UTC")
+// Session continue 07:00→17:00 UTC (London→NY sans gap) — logique V7b
+f_in_session() =>
+    h             = hour(time, "UTC")
+    m             = minute(time, "UTC")
     total_minutes = h * 60 + m
-    london_start = 8 * 60        // 08:00 UTC
-    london_end   = 11 * 60       // 11:00 UTC
-    ny_start     = 14 * 60 + 30  // 14:30 UTC
-    ny_end        = 17 * 60      // 17:00 UTC
-    if total_minutes >= london_start and total_minutes < london_end
-        "london"
-    else if total_minutes >= ny_start and total_minutes < ny_end
-        "ny"
-    else
-        "none"
+    total_minutes >= 7 * 60 and total_minutes < 17 * 60
 
 // Biais directionnel basé sur position par rapport à EMA
 f_direction(price_val, ema_val) =>
@@ -186,9 +208,11 @@ daily_bias_bear = close_daily < ema_50_daily  // biais baissier
 daily_bias_str  = daily_bias_bull ? "bull" : "bear"
 
 // Label biais daily — affiché en haut à gauche, mis à jour à chaque bougie
+highest_10 = ta.highest(high, 10)
+
 if barstate.islast
     label.new(
-         bar_index, ta.highest(high, 10),
+         bar_index, highest_10,
          text      = daily_bias_bull ? "BIAS D: BULL" : "BIAS D: BEAR",
          style     = label.style_label_left,
          color     = daily_bias_bull ? color.new(color.green, 10) : color.new(color.red, 10),
@@ -278,6 +302,16 @@ sweep_high_tp = math.max(sweep_high_sl * 2.5, default_tp_pips)
 sweep_low_sl  = f_price_to_pips(last_swing_low - low + sweep_buffer * 2)
 sweep_low_tp  = math.max(sweep_low_sl * 2.5, default_tp_pips)
 
+// Tracking qualité sweep — le détecteur détecte uniquement les swings (q=1)
+// Compatible avec min_sweep_quality=1 (V7 default)
+var int last_sweep_high_q = 0
+var int last_sweep_low_q  = 0
+
+if sweep_high_cond
+    last_sweep_high_q := 1
+if sweep_low_cond
+    last_sweep_low_q := 1
+
 // Affichage signaux sweep
 if sweep_high_cond and show_labels
     label.new(
@@ -345,6 +379,19 @@ bos_bear_cond = close < bos_ref_low
      and not sweep_high_cond       // pas un double-comptage avec sweep
      and daily_bias_bear           // filtre biais daily
 
+// CHOCH_BEAR — logique exacte V7 :
+//   sweep_high_recent = balayage récent + qualité suffisante
+//   choch_bear        = sweep + cassure de structure basse + biais bear
+sweep_high_recent    = ta.barssince(sweep_high_cond) <= bos_lookback
+     and last_sweep_high_q >= min_sweep_quality
+
+struct_ref_low_choch = ta.lowest(low, 15)[1]
+
+choch_bear = sweep_high_recent
+     and close < struct_ref_low_choch
+     and close[1] >= struct_ref_low_choch
+     and daily_bias_bear
+
 // SL/TP pour BOS
 // SL : sous/sur le niveau cassé + buffer
 bos_bull_sl = f_price_to_pips(close - bos_ref_high) + sweep_buffer_pips + default_sl_pips
@@ -369,18 +416,18 @@ if bos_bull_cond and show_bos_lines
              size   = size.small
          )
 
-if bos_bear_cond and show_bos_lines
+if choch_bear and show_bos_lines
     line.new(
-         bar_index - 1, bos_ref_low,
-         bar_index,     bos_ref_low,
-         color=color.new(color.purple, 20), style=line.style_dashed, width=2
+         bar_index - 1, struct_ref_low_choch,
+         bar_index,     struct_ref_low_choch,
+         color=color.new(color.red, 20), style=line.style_dashed, width=2
      )
     if show_labels
         label.new(
              bar_index, high,
-             text   = "BOS ▼\n" + str.tostring(math.round(bos_bear_sl, 1)) + "p SL",
+             text   = "CHoCH ▼\n" + str.tostring(math.round(bos_bear_sl, 1)) + "p SL",
              style  = label.style_label_down,
-             color  = color.new(color.purple, 10),
+             color  = color.new(color.red, 10),
              textcolor = color.white,
              size   = size.small
          )
@@ -395,11 +442,11 @@ plotshape(
  )
 
 plotshape(
-     bos_bear_cond,
-     title    = "BOS Bear signal",
+     choch_bear,
+     title    = "CHOCH_BEAR signal",
      style    = shape.labeldown,
      location = location.abovebar,
-     color    = color.purple,
+     color    = color.red,
      size     = size.small
  )
 
@@ -520,7 +567,7 @@ payload_sweep_high =
      '"tp_pips":'        + f_fmt(sweep_high_tp, 1)               + ','     +
      '"ema_50_value":'   + f_fmt(ema_50_4h, 5)                   + ','     +
      '"daily_bias":"'    + daily_bias_str                        + '",'    +
-     '"session":"'       + f_session()                           + '"'     +
+     '"session":"'       + (f_in_session() ? "active" : "inactive") + '"'     +
      '}'
 
 // --- Payload SWEEP_LOW ---
@@ -538,7 +585,7 @@ payload_sweep_low =
      '"tp_pips":'        + f_fmt(sweep_low_tp, 1)                + ','     +
      '"ema_50_value":'   + f_fmt(ema_50_4h, 5)                   + ','     +
      '"daily_bias":"'    + daily_bias_str                        + '",'    +
-     '"session":"'       + f_session()                           + '"'     +
+     '"session":"'       + (f_in_session() ? "active" : "inactive") + '"'     +
      '}'
 
 // --- Payload BOS_BULL ---
@@ -555,14 +602,14 @@ payload_bos_bull =
      '"tp_pips":'        + f_fmt(bos_bull_tp, 1)                 + ','     +
      '"ema_50_value":'   + f_fmt(ema_50_4h, 5)                   + ','     +
      '"daily_bias":"'    + daily_bias_str                        + '",'    +
-     '"session":"'       + f_session()                           + '"'     +
+     '"session":"'       + (f_in_session() ? "active" : "inactive") + '"'     +
      '}'
 
-// --- Payload BOS_BEAR ---
-payload_bos_bear =
+// --- Payload CHOCH_BEAR ---
+payload_choch_bear =
      '{'                                                                    +
      '"secret":"'        + secret_key                            + '",'    +
-     '"event_type":"BOS_BEAR",'                                             +
+     '"event_type":"CHOCH_BEAR",'                                             +
      '"symbol":"'        + symbol_override                       + '",'    +
      '"timeframe":"15",'                                                    +
      '"price":'          + f_fmt(close, 5)                       + ','     +
@@ -572,7 +619,7 @@ payload_bos_bear =
      '"tp_pips":'        + f_fmt(bos_bear_tp, 1)                 + ','     +
      '"ema_50_value":'   + f_fmt(ema_50_4h, 5)                   + ','     +
      '"daily_bias":"'    + daily_bias_str                        + '",'    +
-     '"session":"'       + f_session()                           + '"'     +
+     '"session":"'       + (f_in_session() ? "active" : "inactive") + '"'     +
      '}'
 
 // --- Payload SESSION_OPEN ---
@@ -610,7 +657,7 @@ payload_range_breakout =
      '"tp_pips":'        + f_fmt(range_bo_tp, 1)                 + ','     +
      '"ema_50_value":'   + f_fmt(ema_50_4h, 5)                   + ','     +
      '"daily_bias":"'    + daily_bias_str                        + '",'    +
-     '"session":"'       + f_session()                           + '"'     +
+     '"session":"'       + (f_in_session() ? "active" : "inactive") + '"'     +
      '}'
 
 // ============================================================
@@ -647,9 +694,9 @@ alertcondition(
  )
 
 alertcondition(
-     bos_bear_cond,
-     title   = "🟣 BOS_BEAR — Break of Structure Baissier",
-     message = "BOS Bear détecté sur EURUSD 15M. Configurer le message avec le payload JSON BOS_BEAR."
+     choch_bear,
+     title   = "⚡ CHOCH_BEAR — Retournement baissier",
+     message = "CHoCH Bear détecté sur EURUSD 15M. Configurer le message avec le payload JSON CHOCH_BEAR."
  )
 
 alertcondition(
@@ -677,31 +724,30 @@ alertcondition(
 // [5] Message : coller le payload JSON correspondant ci-dessous
 //
 // ─── Message pour SWEEP_HIGH ───────────────────────────────
-// {"secret":"VOTRE_CLE_SECRETE","event_type":"SWEEP_HIGH","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bear","timestamp":"{{timenow}}","sweep_level":{{plot_0}},"sl_pips":20,"tp_pips":50,"ema_50_value":{{plot_1}},"daily_bias":"bear","session":"london"}
+// {"secret":"VOTRE_CLE_SECRETE","event_type":"SWEEP_HIGH","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bear","timestamp":"{{timenow}}","sweep_level":{{plot_0}},"sl_pips":20,"tp_pips":50,"ema_50_value":{{plot_1}},"daily_bias":"bear","session":"active"}
 //
 // ─── Message pour SWEEP_LOW ────────────────────────────────
-// {"secret":"VOTRE_CLE_SECRETE","event_type":"SWEEP_LOW","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bull","timestamp":"{{timenow}}","sweep_level":{{plot_4}},"sl_pips":20,"tp_pips":50,"ema_50_value":{{plot_1}},"daily_bias":"bull","session":"london"}
+// {"secret":"VOTRE_CLE_SECRETE","event_type":"SWEEP_LOW","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bull","timestamp":"{{timenow}}","sweep_level":{{plot_4}},"sl_pips":20,"tp_pips":50,"ema_50_value":{{plot_1}},"daily_bias":"bull","session":"active"}
 //
 // ─── Message pour BOS_BULL ─────────────────────────────────
-// {"secret":"VOTRE_CLE_SECRETE","event_type":"BOS_BULL","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bull","timestamp":"{{timenow}}","sl_pips":15,"tp_pips":40,"ema_50_value":{{plot_1}},"daily_bias":"bull","session":"london"}
+// {"secret":"VOTRE_CLE_SECRETE","event_type":"BOS_BULL","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bull","timestamp":"{{timenow}}","sl_pips":15,"tp_pips":40,"ema_50_value":{{plot_1}},"daily_bias":"bull","session":"active"}
 //
-// ─── Message pour BOS_BEAR ─────────────────────────────────
-// {"secret":"VOTRE_CLE_SECRETE","event_type":"BOS_BEAR","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bear","timestamp":"{{timenow}}","sl_pips":15,"tp_pips":40,"ema_50_value":{{plot_1}},"daily_bias":"bear","session":"london"}
+// ─── Message pour CHOCH_BEAR ───────────────────────────────
+// {"secret":"VOTRE_CLE_SECRETE","event_type":"CHOCH_BEAR","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bear","timestamp":"{{timenow}}","sl_pips":15,"tp_pips":45,"ema_50_value":{{plot_1}},"daily_bias":"bear","session":"active"}
 //
 // ─── Message pour SESSION_OPEN ─────────────────────────────
 // {"secret":"VOTRE_CLE_SECRETE","event_type":"SESSION_OPEN","symbol":"EURUSD","timeframe":"4H","price":{{close}},"direction":"bull","timestamp":"{{timenow}}","ema_50_value":{{plot_1}},"daily_bias":"bull","session":"london"}
 //
 // ─── Message pour RANGE_BREAKOUT ───────────────────────────
-// {"secret":"VOTRE_CLE_SECRETE","event_type":"RANGE_BREAKOUT","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bull","timestamp":"{{timenow}}","range_high":{{plot_2}},"range_low":{{plot_3}},"sl_pips":25,"tp_pips":60,"ema_50_value":{{plot_1}},"daily_bias":"bull","session":"london"}
+// {"secret":"VOTRE_CLE_SECRETE","event_type":"RANGE_BREAKOUT","symbol":"EURUSD","timeframe":"15","price":{{close}},"direction":"bull","timestamp":"{{timenow}}","range_high":{{plot_2}},"range_low":{{plot_3}},"sl_pips":25,"tp_pips":60,"ema_50_value":{{plot_1}},"daily_bias":"bull","session":"active"}
 //
 // NOTE sur {{timenow}} : TradingView envoie un timestamp Unix en ms.
 //   Le bot Python le convertit automatiquement en ISO 8601 UTC.
 //   Alternativement, remplacer par la date fixe au moment de la config.
 //
-// NOTE sur "session" : le champ est statique dans le message template.
-//   Pour le rendre dynamique, dupliquer l'alerte en "london" et "ny"
-//   et activer chaque alerte uniquement pendant la session correspondante.
-//   Le bot filtre de toute façon par heure UTC — la valeur est indicative.
+// NOTE sur "session" : "active" = dans la fenêtre 07:00–17:00 UTC,
+//   "inactive" = hors session. SESSION_OPEN garde "london" en valeur fixe
+//   car il est déclenché manuellement en début de session uniquement.
 //
 // ============================================================
 // VARIABLES EXPORTÉES POUR LES TEMPLATES {{plot_N}}
